@@ -1,0 +1,20 @@
+# Dependencies and build output
+node_modules/
+dist/
+*.tgz
+
+# Tests
+coverage/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Local secrets (AGUMAIL_TEST_KEY lives here)
+.env
+.env.*
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
