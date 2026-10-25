@@ -1,6 +1,6 @@
 {
   "name": "agumail-js",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Add your users to AguMail and record what they do, so your AguMail flows can start from it.",
   "license": "MIT",
   "author": "AguMail",
