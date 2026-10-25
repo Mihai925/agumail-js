@@ -36,7 +36,8 @@ Both calls resolve with what AguMail counted:
 
 ```ts
 const added = await agumail.identify({ email: 'sam@example.com', firstName: 'Sam' });
-// { created: 1, updated: 0, suppressedSkipped: 0, overCapacity: 0, confirmationsSent: 0 }
+// { created: 1, updated: 0, suppressedSkipped: 0, overCapacity: 0, confirmationsSent: 0,
+//   unknownContacts: 0, conflicts: 0, conflicted: [] }
 
 const recorded = await agumail.track({ email: 'sam@example.com', event: 'Created first project' });
 // { created: 1, duplicates: 0, unknownContacts: 0, uniqueId: '0b6f9d3e-...' }
@@ -47,7 +48,8 @@ const recorded = await agumail.track({ email: 'sam@example.com', event: 'Created
 - `overCapacity`: your plan has no room for another contact, so they weren't added.
 - `confirmationsSent`: confirmation emails AguMail sent, for someone coming back after unsubscribing (see [Email settings in your app](#email-settings-in-your-app)).
 - `duplicates`: an event with this `uniqueId` was already recorded, so this one wasn't.
-- `unknownContacts`: AguMail doesn't have this person, so the event was skipped.
+- `unknownContacts`: AguMail doesn't have this person, so the event was skipped. For a contact, it counts those sent with only a `userId` that nobody has.
+- `conflicts` and `conflicted`: contacts refused because their email belongs to someone else (see [Identify by your app's user id](#identify-by-your-apps-user-id)).
 - `uniqueId`: the id the event was sent with: yours, or one the package made up.
 
 ## Never break a signup
@@ -100,6 +102,8 @@ const agumail = new AguMail(process.env.AGUMAIL_API_KEY, {
 | `over_capacity` | Contacts or signups weren't added because your plan has no room for more contacts. |
 | `signups_limited` | Signups over the limit of 10 new addresses per visitor IP a minute were dropped. |
 | `history` | Events dated more than 72 hours ago, sent without `backfill: true`, were stored but start no flows. |
+| `unknown_user_ids` | Contacts sent with only a `userId` that nobody has were skipped. Send the email too, so AguMail can add them. |
+| `conflicts` | Contacts whose email belongs to someone else were refused. `warning.conflicted` lists them. |
 
 Each warning fires at most once per call (or flush), and `warning.count` adds up the records it covers. Warnings fire for calls that throw and calls that don't. Duplicates and `suppressedSkipped` are normal, so they never warn. Both callbacks may be async, and neither can make a call fail.
 
@@ -163,6 +167,46 @@ if (result.error?.uniqueIds) {
 }
 ```
 
+## Identify by your app's user id
+
+If your app gives each user an id, send it as `userId` beside the email. AguMail then knows the person by that id: when they change their email in your app, your next `identify` moves the same contact to the new address. Their status, tags, history and flows stay with them, and they are not counted twice.
+
+```ts
+await agumail.identify({ userId: user.id, email: user.email, firstName: user.firstName });
+```
+
+- `userId` is your own id for the person: text up to 200 characters, sent exactly as you give it, or a whole number, which is sent as text. A contact keeps the first id it is sent with.
+- A contact AguMail already has by email takes the id the first time you send both.
+- With a `userId`, the email is optional: `identify({ userId: user.id, ... })` updates that contact. If nobody has that id, the record is skipped and counted in `unknownContacts`, because a new contact needs an email.
+- `track` takes `userId` in place of `email`, or beside it. With a `userId`, AguMail finds the person by the id alone, and an event never changes anyone's email or id.
+- The `contact` you pass to `track` goes with the event's `userId` and `email`. That upsert works like `identify` (without touching their subscription), so with both it can move the contact to that email.
+- A new address that is on your suppression list stays blocked: the contact keeps its status, and nothing is sent to that address.
+
+AguMail never merges two contacts. A record that would mix two people up is refused without an error, and the rest of the call still lands:
+
+- `email_taken`: the new email already belongs to another contact.
+- `user_id_mismatch`: the contact with that email already has a different `userId`.
+
+`conflicts` counts them and `conflicted` lists each one. `index` is its place in the array you passed, from 0, and for `trackMany`, the place of the event that carried the `contact`:
+
+```ts
+const result = await agumail.identifyMany(users.map((u) => ({ userId: u.id, email: u.email })));
+// { ..., conflicts: 1, conflicted: [{ index: 1, userId: 'user_77', email: 'alex@example.com', reason: 'email_taken' }] }
+```
+
+`onWarning` gets a `conflicts` warning with the same list in `warning.conflicted`, and an `unknown_user_ids` warning for ids nobody has. For [the queue](#batching-with-the-queue), these warnings are how you hear about them, since nobody reads the result of a flush the queue starts itself. In a flush, `index` is the place among the contacts that flush sent, in the order you queued them.
+
+To ask where someone stands by their id, use `contacts.statusByUserId`. It takes one id or an array, like `contacts.status`:
+
+```ts
+const sam = await agumail.contacts.statusByUserId(user.id);
+// { email: 'sam@example.com', userId: 'user_8412', status: 'active', subscribed: true }
+```
+
+For an id nobody has, `email` and `status` are `null`.
+
+`ping()` returns a `shop.userId` too. That one is your AguMail account's id, not one of your users' ids.
+
 ## Contact properties
 
 `properties` become the contact's custom fields in AguMail. AguMail keeps them as text, so the package converts for you:
@@ -187,7 +231,7 @@ await agumail.contacts.unsubscribe(user.email); // they switched it off
 await agumail.contacts.subscribe(user.email);   // they switched it on
 ```
 
-Call these only when the signed-in person changes the setting themselves, never from a sync. When they switch it back on:
+Call these only when the signed-in person changes the setting themselves, never from a sync. They take email addresses, not user ids, so a switch-off holds even for someone AguMail doesn't have yet. When they switch it back on:
 
 - If they switched it off in your app, they are subscribed again straight away.
 - If they clicked unsubscribe in one of your emails, or marked one as spam, AguMail sends them one confirmation email (at most one a day), and they are back when they click it. `confirmationsSent` in the result counts these, so you can tell them to check their inbox.
@@ -199,10 +243,10 @@ To show the switch in the right position, ask AguMail. `subscribed` is the value
 
 ```ts
 const sam = await agumail.contacts.status('sam@example.com');
-// { email: 'sam@example.com', status: 'active', subscribed: true }
+// { email: 'sam@example.com', userId: 'user_8412', status: 'active', subscribed: true }
 ```
 
-`status` is `null` for an address that isn't on your list. Pass an array to ask about as many addresses as you like: the package asks 500 at a time and keeps your order.
+`status` is `null` for an address that isn't on your list, and `userId` is `null` when the contact has none. Pass an array to ask about as many addresses as you like: the package asks 500 at a time and keeps your order. To ask by your app's user ids, use [`contacts.statusByUserId`](#identify-by-your-apps-user-id).
 
 ## Examples
 
@@ -305,6 +349,7 @@ export const addToAguMail: OnAfterSignupHook = async ({ user }) => {
   // Not awaited, and never throws: AguMail can't hold up or fail a signup.
   void agumail.identify(
     {
+      userId: user.id,
       email: user.email,
       firstName: user.firstName,
       lastName: user.lastName,
@@ -323,7 +368,7 @@ import { addToAguMail } from './src/auth/agumail' with { type: 'ref' };
 onAfterSignup: addToAguMail,
 ```
 
-Then record what they do from your actions:
+Then record what they do from your actions. AguMail knows them by their Wasp user id, so that is all an event needs:
 
 ```ts
 // src/campaigns/operations.ts
@@ -332,18 +377,17 @@ import { noThrow } from 'agumail-js';
 import { agumail } from '../server/agumail';
 
 export const createCampaign: CreateCampaign<{ name: string }, { id: string }> = async ({ name }, context) => {
-  const campaign = await context.entities.Campaign.create({ data: { name, userId: context.user!.id } });
-  if (context.user?.email) {
-    void agumail.track(
-      {
-        email: context.user.email,
-        event: 'Created campaign',
-        properties: { campaignId: campaign.id },
-        uniqueId: `campaign_created:${campaign.id}`,
-      },
-      noThrow
-    );
-  }
+  const user = context.user!;
+  const campaign = await context.entities.Campaign.create({ data: { name, userId: user.id } });
+  void agumail.track(
+    {
+      userId: user.id,
+      event: 'Created campaign',
+      properties: { campaignId: campaign.id },
+      uniqueId: `campaign_created:${campaign.id}`,
+    },
+    noThrow
+  );
   return campaign;
 };
 ```
@@ -361,6 +405,7 @@ agumail.queue.track({ email: user.email, event: 'Signed up' });
 - The queue sends itself (a flush) once 500 records are waiting, or 5 seconds after the first one was queued. `flushAt` and `flushIntervalMs` change both.
 - A flush sends every queued contact first, 500 to a request, then every event, so an event never arrives before its contact. The `contact` you pass to `queue.track` goes out with the contacts.
 - A flush that still fails after its retries goes to `onError`, and its records are dropped, not queued again.
+- A queued contact AguMail refuses because its email belongs to someone else is a `conflicts` warning, and a `userId` nobody has is an `unknown_user_ids` warning (see [Identify by your app's user id](#identify-by-your-apps-user-id)).
 - The queue lives in memory, and its timer never keeps a Node process running. Records still queued when the process stops are lost, so flush first.
 
 `flush()` sends everything queued now, and resolves when that's done. It never rejects:
@@ -443,7 +488,7 @@ const { loaderUrl, forms } = await agumail.forms.list();
 Check these in order:
 
 1. **Is the person Subscribed?** Flows started by an event only email Subscribed people. Add them with `identify`, which subscribes them, not with `subscribed: false` and not only through `track`'s `contact`. `agumail.contacts.status(email)` tells you where they stand.
-2. **Did AguMail have them before the event?** An event for someone AguMail doesn't have is skipped and counted in `unknownContacts`, and `onWarning` gets `unknown_contacts`. Identify them first and wait for it, or pass `contact`, or use the queue.
+2. **Did AguMail have them before the event?** An event for someone AguMail doesn't have is skipped and counted in `unknownContacts`, and `onWarning` gets `unknown_contacts`. Identify them first and wait for it, or pass `contact`, or use the queue. An event sent by `userId` needs a contact with that id, so identify them with both their `userId` and their email.
 3. **Did it happen in the last 72 hours?** An `occurredAt` older than that counts as history: stored, but no flow starts. `onWarning` gets `history`.
 4. **Was the uniqueId new?** An id AguMail has seen before, for any event, counts in `duplicates` and starts nothing.
 5. **Does the flow's trigger name the same event?** "Upgraded plan" and "upgraded_plan" match, but "Upgraded" doesn't.
@@ -460,6 +505,7 @@ Check these in order:
 | Names | first and last name up to 100 characters, phone up to 40 |
 | Event name | up to 60 characters |
 | `uniqueId` | up to 120 characters |
+| `userId` | up to 200 characters |
 
 Every `identify` or `track` is one request (`track` with `contact` is two), so an app sending more than about 2 a second will be slowed down. Use `identifyMany` and `trackMany` for bulk work, and [the queue](#batching-with-the-queue) for a busy app.
 
@@ -506,7 +552,7 @@ Retried errors are tried 3 more times, with growing waits. If AguMail asks for a
 
 The package refuses to run in a browser, and that includes test setups that fake one, such as jsdom. Run tests that use it in a Node environment, or mock the package.
 
-For tests and local development, `disabled: true` sends nothing and needs no key. Calls still check their input and options, so a bad record still fails. They resolve with empty results: zero counts, a generated `uniqueId`, and `status: null` for every address. No warnings fire.
+For tests and local development, `disabled: true` sends nothing and needs no key. Calls still check their input and options, so a bad record still fails. They resolve with empty results: zero counts, a generated `uniqueId`, and `status: null` for every address and user id. No warnings fire.
 
 ```ts
 const agumail = new AguMail(process.env.AGUMAIL_API_KEY, {
@@ -550,32 +596,36 @@ Every call also takes `{ throwOnError, timeoutMs, signal }`, and `identifyMany` 
 ## API
 
 ```ts
-agumail.identify(contact, options?)             // Promise<ContactCounts>
-agumail.identifyMany(contacts, options?)        // Promise<ContactCounts>
-agumail.track(event, options?)                  // Promise<TrackResult>
-agumail.trackMany(events, options?)             // Promise<TrackManyResult>
-agumail.contacts.status(email, options?)        // Promise<ContactStatus>
-agumail.contacts.status(emails, options?)       // Promise<ContactStatus[]>
-agumail.contacts.subscribe(emails, options?)    // Promise<ContactCounts>
-agumail.contacts.unsubscribe(emails, options?)  // Promise<ContactCounts>
-agumail.forms.list(options?)                    // Promise<FormList>
-agumail.signups.create(signups, options?)       // Promise<SignupCounts>
-agumail.ping(options?)                          // Promise<PingResult>
-agumail.queue.identify(contact)                 // void
-agumail.queue.track(event)                      // void
-agumail.flush(options?)                         // Promise<FlushResult>
+agumail.identify(contact, options?)                 // Promise<ContactCounts>
+agumail.identifyMany(contacts, options?)            // Promise<ContactCounts>
+agumail.track(event, options?)                      // Promise<TrackResult>
+agumail.trackMany(events, options?)                 // Promise<TrackManyResult>
+agumail.contacts.status(email, options?)            // Promise<ContactStatus>
+agumail.contacts.status(emails, options?)           // Promise<ContactStatus[]>
+agumail.contacts.statusByUserId(userId, options?)   // Promise<ContactStatus>
+agumail.contacts.statusByUserId(userIds, options?)  // Promise<ContactStatus[]>
+agumail.contacts.subscribe(emails, options?)        // Promise<ContactCounts>
+agumail.contacts.unsubscribe(emails, options?)      // Promise<ContactCounts>
+agumail.forms.list(options?)                        // Promise<FormList>
+agumail.signups.create(signups, options?)           // Promise<SignupCounts>
+agumail.ping(options?)                              // Promise<PingResult>
+agumail.queue.identify(contact)                     // void
+agumail.queue.track(event)                          // void
+agumail.flush(options?)                             // Promise<FlushResult>
 ```
 
 With `throwOnError: false` (or `noThrow`), a call that resolves to `T` resolves to `{ data: T, error: null } | { data: null, error: AguMailError }` instead. The methods work taken off the client too: `const { identify, track } = agumail`.
 
 ```ts
-ContactCounts   // { created, updated, suppressedSkipped, overCapacity, confirmationsSent? }
+ContactCounts   // { created, updated, suppressedSkipped, overCapacity, confirmationsSent?,
+                //   unknownContacts?, conflicts?, conflicted?: ContactConflict[] }
+ContactConflict // { index, userId, email, reason: 'email_taken' | 'user_id_mismatch' }
 TrackResult     // { created, duplicates, unknownContacts, uniqueId, contact?: ContactCounts }
 TrackManyResult // { created, duplicates, unknownContacts, uniqueIds, contacts?: ContactCounts }
-ContactStatus   // { email, status, subscribed }
+ContactStatus   // { email, userId, status, subscribed }
 FormList        // { loaderUrl, forms: { slug, name, doubleOptIn, publishedAt }[] }
 SignupCounts    // { received, overCapacity, limited }
-PingResult      // { shop: { userId, shopName } }
+PingResult      // { shop: { userId, shopName } }: userId is your AguMail account's id
 FlushResult     // { contacts: ContactCounts, events: EventCounts, error: AguMailError | null }
 ```
 
@@ -583,7 +633,6 @@ These types, and `Contact`, `TrackEvent`, `Signup` and the rest, are exported, a
 
 ## Coming
 
-- Identifying contacts by your own user id, not only by email.
 - Deleting a contact.
 - Verifying AguMail's webhooks, for unsubscribes and bounces.
 - Syncing customers from Stripe and users from auth providers.

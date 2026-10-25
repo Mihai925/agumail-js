@@ -57,6 +57,29 @@ describe('queue', () => {
     expect(result).toEqual({ contacts: { ...zeroContacts, created: 2 }, events: { ...zeroEvents, created: 2 }, error: null });
   });
 
+  it('queues by userId, and numbers a conflict in a flush by the order the contacts were queued', async () => {
+    const warnings: AguMailWarning[] = [];
+    const conflicted = [{ index: 2, userId: 'user_3', email: 'taken@example.com', reason: 'email_taken' }];
+    const { fetch, sent } = mockFetch((request) =>
+      request.url.endsWith('/events')
+        ? eventsOk(request.body.events.length)
+        : ok({ created: 1, updated: 1, suppressedSkipped: 0, overCapacity: 0, unknownContacts: 0, conflicts: 1, conflicted })
+    );
+    const agumail = client(fetch, { flushIntervalMs: 0, onWarning: (w) => void warnings.push(w) });
+    agumail.queue.identify({ userId: 'user_1' });
+    agumail.queue.track({ userId: 'user_2', event: 'Signed up', contact: { firstName: 'Sam' } });
+    agumail.queue.identify({ userId: 'user_3', email: 'taken@example.com' });
+    const result = await agumail.flush();
+    expect(sent[0]!.body.contacts).toEqual([
+      { userId: 'user_1', consent: { optedIn: true, source: 'api' } },
+      { userId: 'user_2', firstName: 'Sam' },
+      { userId: 'user_3', email: 'taken@example.com', consent: { optedIn: true, source: 'api' } },
+    ]);
+    expect(sent[1]!.body.events.map((e: any) => e.userId)).toEqual(['user_2']);
+    expect(result.contacts).toMatchObject({ conflicts: 1, conflicted });
+    expect(warnings).toEqual([{ code: 'conflicts', count: 1, message: expect.any(String), conflicted }]);
+  });
+
   it('fixes an event uniqueId when it is queued, without changing the event', async () => {
     const { fetch, sent } = mockFetch(created);
     const agumail = client(fetch, { flushIntervalMs: 0 });
@@ -224,10 +247,14 @@ describe('queue', () => {
     expect(() => agumail.queue.identify({ email: 'nope' })).not.toThrow();
     agumail.queue.track({ email: 'sam@example.com', event: 'x', contact: { subscribed: true } as any });
     agumail.queue.track(null as any);
+    agumail.queue.identify({ firstName: 'Sam' });
+    agumail.queue.track({ event: 'Logged in', userId: '' });
     expect(onError.mock.calls.map(([e]) => [e.code, e.message.split(' ')[0]])).toEqual([
       ['invalid_input', 'contact.email'],
       ['invalid_input', 'event.contact.subscribed'],
       ['invalid_input', 'event'],
+      ['invalid_input', 'contact.email'],
+      ['invalid_input', 'event.userId'],
     ]);
     expect(await agumail.flush()).toEqual(nothing);
     expect(calls()).toBe(0);

@@ -47,6 +47,42 @@ describe('onWarning', () => {
     ]);
   });
 
+  it('reports contacts refused for an email that is someone else, with the list numbered by your array', async () => {
+    const { agumail, warnings } = watched((request) => {
+      const third = request.body.contacts[2];
+      return ok({
+        created: 0,
+        updated: request.body.contacts.length - 1,
+        suppressedSkipped: 0,
+        overCapacity: 0,
+        unknownContacts: 0,
+        conflicts: 1,
+        conflicted: [{ index: 2, userId: third.userId, email: third.email, reason: 'email_taken' }],
+      });
+    });
+    await agumail.identifyMany(Array.from({ length: 600 }, (_, i) => ({ userId: `user_${i}`, email: `p${i}@example.com` })));
+    expect(warnings).toEqual([
+      {
+        code: 'conflicts',
+        count: 2,
+        message: expect.stringContaining('conflicted'),
+        conflicted: [
+          { index: 2, userId: 'user_2', email: 'p2@example.com', reason: 'email_taken' },
+          { index: 502, userId: 'user_502', email: 'p502@example.com', reason: 'email_taken' },
+        ],
+      },
+    ]);
+    expect(warnings[0]!.message).toContain('never merges');
+  });
+
+  it('reports contacts sent with only a userId that no contact has', async () => {
+    const { agumail, warnings } = watched(
+      ok({ created: 0, updated: 0, suppressedSkipped: 0, overCapacity: 0, unknownContacts: 1, conflicts: 0, conflicted: [] })
+    );
+    await agumail.identify({ userId: 'user_new' });
+    expect(warnings).toEqual([{ code: 'unknown_user_ids', count: 1, message: expect.stringContaining('email') }]);
+  });
+
   it('reports signups refused by a full plan or the per-visitor limit', async () => {
     const { agumail, warnings } = watched(ok({ received: 3, overCapacity: 1, limited: 2 }));
     await agumail.signups.create([

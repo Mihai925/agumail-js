@@ -61,6 +61,47 @@ describe('track', () => {
     expect(result.contact).toEqual({ created: 1, updated: 0, suppressedSkipped: 0, overCapacity: 0 });
   });
 
+  it('posts an event by your userId alone', async () => {
+    const { fetch, sent } = mockFetch(eventsOk());
+    await client(fetch).track({ userId: 8412, event: 'Logged in', uniqueId: 'login:1' });
+    expect(sent[0]!.body.events).toEqual([{ userId: '8412', metric: 'Logged in', uniqueId: 'login:1' }]);
+  });
+
+  it('sends a userId beside the email', async () => {
+    const { fetch, sent } = mockFetch(eventsOk());
+    await client(fetch).track({ email: 'sam@example.com', userId: 'user_8412', event: 'Logged in', uniqueId: 'login:1' });
+    expect(sent[0]!.body.events).toEqual([
+      { email: 'sam@example.com', userId: 'user_8412', metric: 'Logged in', uniqueId: 'login:1' },
+    ]);
+  });
+
+  it("upserts the contact first with the event's userId, and its email when there is one", async () => {
+    const { fetch, sent } = mockFetch((request) => (request.url.endsWith('/contacts') ? contactsOk() : eventsOk()));
+    const agumail = client(fetch);
+    await agumail.track({ userId: 'user_8412', event: 'Upgraded', contact: { firstName: 'Sam' } });
+    await agumail.track({ userId: 'user_8412', email: 'sam@example.com', event: 'Upgraded', contact: { lastName: 'Rivera' } });
+    expect(sent.filter((r) => r.url.endsWith('/contacts')).map((r) => r.body.contacts)).toEqual([
+      [{ userId: 'user_8412', firstName: 'Sam' }],
+      [{ email: 'sam@example.com', userId: 'user_8412', lastName: 'Rivera' }],
+    ]);
+  });
+
+  it('puts a conflict of its contact on the result', async () => {
+    const conflicted = [{ index: 0, userId: 'user_8412', email: 'alex@example.com', reason: 'email_taken' }];
+    const { fetch } = mockFetch(
+      ok({ created: 0, updated: 0, suppressedSkipped: 0, overCapacity: 0, unknownContacts: 0, conflicts: 1, conflicted }),
+      eventsOk()
+    );
+    const result = await client(fetch).track({
+      userId: 'user_8412',
+      email: 'alex@example.com',
+      event: 'Upgraded',
+      contact: { firstName: 'Sam' },
+    });
+    expect(result.contact).toMatchObject({ conflicts: 1, conflicted });
+    expect(result.created).toBe(1);
+  });
+
   it('refuses subscribed inside contact: track never changes a subscription', async () => {
     const { fetch, calls } = mockFetch(eventsOk());
     const error = await rejection(
@@ -89,6 +130,19 @@ describe('track', () => {
     ['eventName instead of event', { email: 'sam@example.com', eventName: 'Logged in' }, 'event.eventName is not a field AguMail knows. Use event.'],
     ['event_name instead of event', { email: 'sam@example.com', event_name: 'Logged in' }, 'event.event_name is not a field AguMail knows. Use event.'],
     ['a missing event', { email: 'sam@example.com' }, 'event.event is required'],
+    ['no email and no userId', { event: 'Logged in' }, 'event.email is required when there is no userId'],
+    ['an empty userId', { userId: '', event: 'Logged in' }, 'event.userId cannot be blank'],
+    ['a userId over 200 characters', { userId: 'u'.repeat(201), event: 'Logged in' }, 'event.userId can be at most 200'],
+    [
+      'userId inside contact',
+      { email: 'sam@example.com', event: 'x', contact: { userId: 'user_1' } },
+      'event.contact.userId is not a field AguMail knows. Put it on the event itself.',
+    ],
+    [
+      'email inside contact',
+      { userId: 'user_1', event: 'x', contact: { email: 'sam@example.com' } },
+      'event.contact.email is not a field AguMail knows. Put it on the event itself.',
+    ],
     ['an event name over 60 characters', { email: 'sam@example.com', event: 'e'.repeat(61) }, 'at most 60'],
     ['an event name with no letters or digits', { email: 'sam@example.com', event: '!!!' }, 'at least one letter or digit'],
     ['a uniqueId over 120 characters', { email: 'sam@example.com', event: 'x', uniqueId: 'u'.repeat(121) }, 'at most 120'],
@@ -224,6 +278,34 @@ describe('trackMany', () => {
     expect(sent.every((r) => r.body.backfill === true)).toBe(true);
     expect(sent.every((r) => !JSON.stringify(r.body).includes('consent'))).toBe(true);
     expect(result.contacts).toEqual({ created: 2, updated: 0, suppressedSkipped: 0, overCapacity: 0 });
+  });
+
+  it('numbers a contact conflict by the event that carried the contact', async () => {
+    const { fetch } = mockFetch((request) => {
+      if (!request.url.endsWith('/contacts')) return eventsOk(request.body.events.length);
+      const second = request.body.contacts[1];
+      return ok({
+        created: request.body.contacts.length - 1,
+        updated: 0,
+        suppressedSkipped: 0,
+        overCapacity: 0,
+        unknownContacts: 0,
+        conflicts: 1,
+        conflicted: [{ index: 1, userId: second.userId, email: second.email, reason: 'email_taken' }],
+      });
+    });
+    const events = Array.from({ length: 600 }, (_, i) => ({
+      email: `p${i}@example.com`,
+      userId: `user_${i}`,
+      event: 'Signed up',
+      ...(i % 2 === 0 ? { contact: { firstName: `P${i}` } } : {}),
+    }));
+    const result = await client(fetch).trackMany(events);
+    expect(result.contacts?.conflicts).toBe(2);
+    expect(result.contacts?.conflicted).toEqual([
+      { index: 2, userId: 'user_2', email: 'p2@example.com', reason: 'email_taken' },
+      { index: 502, userId: 'user_502', email: 'p502@example.com', reason: 'email_taken' },
+    ]);
   });
 
   it('gives every event its own generated id, and returns them in order', async () => {

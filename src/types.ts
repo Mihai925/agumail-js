@@ -1,6 +1,12 @@
 import type { AguMailError } from './errors';
 
-export type AguMailWarningCode = 'unknown_contacts' | 'over_capacity' | 'signups_limited' | 'history';
+export type AguMailWarningCode =
+  | 'unknown_contacts'
+  | 'over_capacity'
+  | 'signups_limited'
+  | 'history'
+  | 'unknown_user_ids'
+  | 'conflicts';
 
 /** Records AguMail took without an error, but dropped or held back. */
 export interface AguMailWarning {
@@ -8,6 +14,8 @@ export interface AguMailWarning {
   message: string;
   /** How many records it covers, added up over the call or flush. */
   count: number;
+  /** On a `conflicts` warning: the contacts AguMail refused, and why. */
+  conflicted?: ContactConflict[];
 }
 
 export interface AguMailOptions {
@@ -30,7 +38,8 @@ export interface AguMailOptions {
   /**
    * Called when AguMail took a call without an error but dropped or held back
    * some of it: events for unknown contacts, a full plan, rate-limited signups,
-   * or events old enough to count as history. It may be async.
+   * events old enough to count as history, a userId nobody has, or an email
+   * that belongs to someone else. It may be async.
    */
   onWarning?: ((warning: AguMailWarning) => void | Promise<void>) | undefined;
   /**
@@ -97,7 +106,15 @@ export type Outcome<T, O> = O extends { throwOnError: false }
 export type PropertyValue = string | number | boolean | Date | null | undefined;
 
 export interface Contact {
-  email: string;
+  /** Needed unless you pass userId. With a userId, it is the address the contact should have. */
+  email?: string | null | undefined;
+  /**
+   * Your app's own id for the person, up to 200 characters, sent exactly as you
+   * give it (a whole number is sent as text). AguMail then knows them by it: when
+   * they change their email in your app, identify moves the same contact to the
+   * new address. A contact keeps the first id it is sent with.
+   */
+  userId?: string | number | null | undefined;
   firstName?: string | null | undefined;
   lastName?: string | null | undefined;
   phone?: string | null | undefined;
@@ -115,10 +132,13 @@ export interface Contact {
   customerSince?: string | Date | null | undefined;
 }
 
-export type ContactProfile = Omit<Contact, 'email' | 'subscribed'>;
+export type ContactProfile = Omit<Contact, 'email' | 'userId' | 'subscribed'>;
 
 export interface TrackEvent {
-  email: string;
+  /** Who did it. Needed unless you pass userId. */
+  email?: string | null | undefined;
+  /** Your app's own id for the person. With one, AguMail finds them by it alone, and reads no email. */
+  userId?: string | number | null | undefined;
   /** Your name for what happened, such as "Created first campaign". */
   event: string;
   /** Any plain object, nested or typed by your own interface. Sent as JSON. */
@@ -132,7 +152,11 @@ export interface TrackEvent {
    * your whole account. One is generated when you leave it out.
    */
   uniqueId?: string | null | undefined;
-  /** Upserts the contact first, with these fields. Never changes their subscription. */
+  /**
+   * Upserts the contact first, with these fields and the event's email and userId.
+   * That upsert is an identify that never changes their subscription: with both
+   * email and userId, it can move the contact to that email.
+   */
   contact?: ContactProfile | null | undefined;
 }
 
@@ -162,6 +186,34 @@ export interface ContactCounts {
   overCapacity: number;
   /** Sent by AguMail servers that report confirmation emails. */
   confirmationsSent?: number;
+  /**
+   * Contacts sent with only a userId that no contact has, so they were skipped:
+   * a new contact needs an email. Sent by AguMail servers that know user ids, as
+   * are conflicts and conflicted.
+   */
+  unknownContacts?: number;
+  /** Contacts refused because their email belongs to someone else. */
+  conflicts?: number;
+  /** Each contact refused, and why. AguMail never merges two contacts. */
+  conflicted?: ContactConflict[];
+}
+
+/**
+ * - `email_taken`: the userId's contact can't move to this email, because another contact has it.
+ * - `user_id_mismatch`: the contact with this email already has a different userId.
+ */
+export type ContactConflictReason = 'email_taken' | 'user_id_mismatch';
+
+export interface ContactConflict {
+  /**
+   * The record's place in the array you passed, from 0: the contact's for
+   * identifyMany, the event's for trackMany. In a flush, its place among the
+   * contacts that flush sent, in the order they were queued.
+   */
+  index: number;
+  userId: string | null;
+  email: string | null;
+  reason: ContactConflictReason;
 }
 
 export interface EventCounts {
@@ -192,8 +244,11 @@ export type ContactStatusValue =
   | 'cleaned';
 
 export interface ContactStatus {
-  email: string;
-  /** null when the address is not on your list. */
+  /** The address asked about, or the contact's own when you asked by userId. null for an id nobody has. */
+  email: string | null;
+  /** The id asked about, or the contact's own when you asked by email. null when it has none, or nobody has the address. */
+  userId: string | null;
+  /** null when the address or id is not on your list. */
   status: ContactStatusValue | null;
   /** The one to act on: subscribed, and not unsubscribed or bounced since. */
   subscribed: boolean;
@@ -220,5 +275,6 @@ export interface SignupCounts {
 }
 
 export interface PingResult {
+  /** `userId` is your AguMail account's id, not one of your app's user ids. */
   shop: { userId: string; shopName: string | null };
 }

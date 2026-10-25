@@ -20,8 +20,8 @@ describe('contacts.status', () => {
       ['https://api.agumail.com/api/v1/contacts/status', 1],
     ]);
     expect(answers.map((a) => a.email)).toEqual(emails);
-    expect(answers[1]).toEqual({ email: 'p1@example.com', status: 'active', subscribed: true });
-    expect(answers[0]).toEqual({ email: 'p0@example.com', status: null, subscribed: false });
+    expect(answers[1]).toEqual({ email: 'p1@example.com', userId: null, status: 'active', subscribed: true });
+    expect(answers[0]).toEqual({ email: 'p0@example.com', userId: null, status: null, subscribed: false });
   });
 
   it('sends nothing for no addresses', async () => {
@@ -34,7 +34,19 @@ describe('contacts.status', () => {
     const { fetch, sent } = mockFetch(ok({ contacts: [{ email: 'sam@example.com', status: 'active', subscribed: true }] }));
     const answer = await client(fetch).contacts.status('sam@example.com');
     expect(sent[0]!.body).toEqual({ emails: ['sam@example.com'] });
-    expect(answer).toEqual({ email: 'sam@example.com', status: 'active', subscribed: true });
+    expect(answer).toEqual({ email: 'sam@example.com', userId: null, status: 'active', subscribed: true });
+  });
+
+  it('names the userId the contact has, when it has one', async () => {
+    const { fetch } = mockFetch(
+      ok({ contacts: [{ email: 'sam@example.com', userId: 'user_8412', status: 'active', subscribed: true }] })
+    );
+    expect(await client(fetch).contacts.status('sam@example.com')).toEqual({
+      email: 'sam@example.com',
+      userId: 'user_8412',
+      status: 'active',
+      subscribed: true,
+    });
   });
 
   it('names a bad single address as email', async () => {
@@ -54,6 +66,87 @@ describe('contacts.status', () => {
     const { fetch } = mockFetch(ok());
     const error = await rejection(client(fetch).contacts.status([`${'a'.repeat(320)}@x.co`]));
     expect(error.message).toContain('emails[0]');
+  });
+});
+
+describe('contacts.statusByUserId', () => {
+  it('asks by userIds in batches of 500, sends numbers as text, and keeps the order asked', async () => {
+    const { fetch, sent } = mockFetch((request) =>
+      ok({
+        contacts: request.body.userIds.map((userId: string, i: number) => ({
+          email: i % 2 ? `${userId}@example.com` : null,
+          userId,
+          status: i % 2 ? 'active' : null,
+          subscribed: i % 2 === 1,
+        })),
+      })
+    );
+    const ids = Array.from({ length: 1001 }, (_, i) => (i === 0 ? 8412 : `user_${i}`));
+    const answers = await client(fetch).contacts.statusByUserId(ids);
+    expect(sent.map((r) => [r.url, r.body.userIds.length])).toEqual([
+      ['https://api.agumail.com/api/v1/contacts/status', 500],
+      ['https://api.agumail.com/api/v1/contacts/status', 500],
+      ['https://api.agumail.com/api/v1/contacts/status', 1],
+    ]);
+    expect(sent[0]!.body).not.toHaveProperty('emails');
+    expect(answers.map((a) => a.userId)).toEqual(ids.map(String));
+    expect(answers[0]).toEqual({ email: null, userId: '8412', status: null, subscribed: false });
+    expect(answers[1]).toEqual({ email: 'user_1@example.com', userId: 'user_1', status: 'active', subscribed: true });
+  });
+
+  it('answers one id with one status', async () => {
+    const { fetch, sent } = mockFetch(
+      ok({ contacts: [{ email: 'sam@example.com', userId: 'user_8412', status: 'active', subscribed: true }] })
+    );
+    const answer = await client(fetch).contacts.statusByUserId('user_8412');
+    expect(sent[0]!.body).toEqual({ userIds: ['user_8412'] });
+    expect(answer).toEqual({ email: 'sam@example.com', userId: 'user_8412', status: 'active', subscribed: true });
+  });
+
+  it('answers an id with no contact as not on your list, even when AguMail sends no answer', async () => {
+    const { fetch } = mockFetch(ok({ contacts: [] }));
+    expect(await client(fetch).contacts.statusByUserId(42)).toEqual({
+      email: null,
+      userId: '42',
+      status: null,
+      subscribed: false,
+    });
+  });
+
+  it('sends nothing for no ids', async () => {
+    const { fetch, calls } = mockFetch(ok());
+    expect(await client(fetch).contacts.statusByUserId([])).toEqual([]);
+    expect(calls()).toBe(0);
+  });
+
+  it('takes frozen arrays', async () => {
+    const { fetch, sent } = mockFetch(ok({ contacts: [] }));
+    await client(fetch).contacts.statusByUserId(Object.freeze(['user_1', 2]));
+    expect(sent[0]!.body).toEqual({ userIds: ['user_1', '2'] });
+  });
+
+  it.each([
+    ['an id over 200 characters', ['u'.repeat(201)], 'userIds[0] can be at most 200 characters'],
+    ['an id that is not a whole number', ['user_1', 1.5], 'userIds[1] must be text or a whole number'],
+    ['an id that is an object', [{ id: 1 }], 'userIds[0] must be text or a whole number'],
+  ])('refuses %s before asking', async (_label, ids, message) => {
+    const { fetch, calls } = mockFetch(ok());
+    const error = await rejection(client(fetch).contacts.statusByUserId(ids as any));
+    expect(error.code).toBe('invalid_input');
+    expect(error.message).toContain(message);
+    expect(calls()).toBe(0);
+  });
+
+  it('names a bad single id as userId', async () => {
+    const { fetch } = mockFetch(ok());
+    const result = await client(fetch).contacts.statusByUserId('u'.repeat(201), { throwOnError: false });
+    expect(result.error?.message).toContain('userId can be at most 200');
+  });
+
+  it('refuses something that is neither an id nor an array', async () => {
+    const { fetch } = mockFetch(ok());
+    const error = await rejection(client(fetch).contacts.statusByUserId(null as any));
+    expect(error.message).toContain('userIds must be an array');
   });
 });
 

@@ -9,6 +9,7 @@ import {
   list,
   signupRecord,
   statusEmail,
+  statusUserId,
   type CheckedEvent,
 } from './records';
 import { baseUrlProblem, normalizeBaseUrl, request, type Transport } from './request';
@@ -20,6 +21,8 @@ import type {
   BatchOptions,
   CallOptions,
   Contact,
+  ContactConflict,
+  ContactConflictReason,
   ContactCounts,
   ContactStatus,
   ContactStatusValue,
@@ -43,20 +46,30 @@ type Tally = Record<AguMailWarningCode, number>;
 interface Call {
   options: FlushOptions | undefined;
   tally: Tally;
+  /** The contacts AguMail refused, which the conflicts warning carries. */
+  conflicted: ContactConflict[];
 }
 
 /** How to send one kind of record in batches, and add up what AguMail counts. */
 interface Sender<C> {
   path: string;
   key: string;
-  read: (body: Json) => C;
+  /** `indexOf` turns a record's place in the request into its place in the caller's array. */
+  read: (body: Json, indexOf: (i: number) => number) => C;
   add: (a: C, b: C) => C;
-  tally: (tally: Tally, counts: C) => void;
+  tally: (call: Call, counts: C) => void;
 }
 
 const DEFAULT_MAX_RETRIES = 3;
 const DEFAULT_FLUSH_INTERVAL_MS = 5_000;
-const WARNING_CODES: AguMailWarningCode[] = ['unknown_contacts', 'over_capacity', 'signups_limited', 'history'];
+const WARNING_CODES: AguMailWarningCode[] = [
+  'unknown_contacts',
+  'over_capacity',
+  'signups_limited',
+  'history',
+  'unknown_user_ids',
+  'conflicts',
+];
 
 /**
  * Call options for a call that never throws: it resolves to `{ data, error }`.
@@ -83,6 +96,27 @@ export interface ContactsApi {
    */
   status<O extends CallOptions | undefined = undefined>(
     emails: readonly string[],
+    options?: O
+  ): Promise<Outcome<ContactStatus[], O>>;
+  /**
+   * Where the contact with your app's user id stands, as status answers for an address.
+   * `email` is the address that contact has, and `status` is null for an id nobody has.
+   *
+   * @example
+   * const { subscribed } = await agumail.contacts.statusByUserId(user.id);
+   */
+  statusByUserId<O extends CallOptions | undefined = undefined>(
+    userId: string | number,
+    options?: O
+  ): Promise<Outcome<ContactStatus, O>>;
+  /**
+   * Where each user id stands, in the order you asked, 500 to a request.
+   *
+   * @example
+   * const answers = await agumail.contacts.statusByUserId(users.map((u) => u.id));
+   */
+  statusByUserId<O extends CallOptions | undefined = undefined>(
+    userIds: readonly (string | number)[],
     options?: O
   ): Promise<Outcome<ContactStatus[], O>>;
   /**
@@ -132,6 +166,8 @@ export interface QueueApi {
   /**
    * Queues a contact for the next flush, subscribed unless `subscribed: false`, as
    * with identify. Never throws: a bad record goes to onError and is not queued.
+   * A contact AguMail refuses because its email belongs to someone else is a
+   * `conflicts` warning, and is listed in the flush's result.
    *
    * @example
    * agumail.queue.identify({ email: user.email, firstName: user.firstName });
@@ -196,9 +232,12 @@ export class AguMail {
   /**
    * Adds or updates a contact, and subscribes them unless you pass `subscribed: false`.
    * It never brings back someone who unsubscribed or bounced (`suppressedSkipped`).
+   * Pass your app's `userId` and AguMail knows them by it, so a changed email moves
+   * the same contact. A record that would mix two people up is refused without an
+   * error, and listed in `conflicted`.
    *
    * @example
-   * await agumail.identify({ email: 'sam@example.com', firstName: 'Sam' });
+   * await agumail.identify({ email: 'sam@example.com', userId: user.id, firstName: 'Sam' });
    */
   identify<O extends CallOptions | undefined = undefined>(contact: Contact, options?: O): Promise<Outcome<ContactCounts, O>> {
     const core = this.#core;
@@ -210,6 +249,7 @@ export class AguMail {
   /**
    * identify for any number of contacts, 500 to a request. Every record is checked
    * first, and nothing is sent if one is wrong. Pass `backfill: true` for an import.
+   * Each entry of `conflicted` gives its contact's place in your array as `index`.
    *
    * @example
    * await agumail.identifyMany(users.map((u) => ({ email: u.email, subscribed: u.marketingOptIn })), { backfill: true });
@@ -226,8 +266,9 @@ export class AguMail {
   }
 
   /**
-   * Records something a contact did. AguMail skips events for people it doesn't have,
-   * so identify them first, or pass `contact` to upsert them (never subscribed) first.
+   * Records something a contact did, named by email or by your app's `userId`. AguMail
+   * skips events for people it doesn't have, so identify them first, or pass `contact`
+   * to upsert them (never subscribed) first.
    *
    * @example
    * await agumail.track({ email: 'sam@example.com', event: 'Created project', uniqueId: `project:${id}` });
@@ -243,7 +284,8 @@ export class AguMail {
 
   /**
    * track for any number of events, 500 to a request, each batch's contacts first.
-   * On failure, `error.uniqueIds` holds the id each event was sent with.
+   * On failure, `error.uniqueIds` holds the id each event was sent with. A conflict
+   * in `contacts.conflicted` gives its event's place in your array as `index`.
    *
    * @example
    * const { uniqueIds } = await agumail.trackMany(rows.map((r) => ({ email: r.email, event: 'Imported' })));
@@ -297,22 +339,27 @@ export class AguMail {
 }
 
 function contactsApi(core: Core): ContactsApi {
-  const status = (emails: string | readonly string[], options?: CallOptions) =>
-    core.run<ContactStatus | ContactStatus[], CallOptions | undefined>(options, async (call) => {
-      const one = typeof emails === 'string';
-      const asked = one
-        ? [statusEmail(emails, 'email')]
-        : list<unknown>(emails, 'emails').map((e, i) => statusEmail(e, `emails[${i}]`));
-      const answers: ContactStatus[] = [];
-      for (let i = 0; i < asked.length; i += BATCH_SIZE) {
-        const batch = asked.slice(i, i + BATCH_SIZE);
-        answers.push(...statuses(await core.post('/api/v1/contacts/status', { emails: batch }, batch.length, call)));
-      }
-      if (!one) return answers;
-      return answers[0] ?? { email: asked[0]!, status: null, subscribed: false };
-    });
+  // Asked 500 at a time, by emails or by userIds: one answer for one, an array for an array.
+  const lookup =
+    (by: 'email' | 'userId', check: (value: unknown, at: string) => string) =>
+    (given: unknown, options?: CallOptions) =>
+      core.run<ContactStatus | ContactStatus[], CallOptions | undefined>(options, async (call) => {
+        const key = `${by}s`;
+        const one = typeof given === 'string' || (by === 'userId' && typeof given === 'number');
+        const asked = one ? [check(given, by)] : list<unknown>(given, key).map((v, i) => check(v, `${key}[${i}]`));
+        const answers: ContactStatus[] = [];
+        for (let i = 0; i < asked.length; i += BATCH_SIZE) {
+          const batch = asked.slice(i, i + BATCH_SIZE);
+          answers.push(...statuses(await core.post('/api/v1/contacts/status', { [key]: batch }, batch.length, call)));
+        }
+        if (!one) return answers;
+        const first = asked[0]!;
+        const unknown = { email: by === 'email' ? first : null, userId: by === 'userId' ? first : null };
+        return answers[0] ?? { ...unknown, status: null, subscribed: false };
+      });
   return {
-    status: status as ContactsApi['status'],
+    status: lookup('email', statusEmail) as ContactsApi['status'],
+    statusByUserId: lookup('userId', statusUserId) as ContactsApi['statusByUserId'],
     subscribe: <O extends CallOptions | undefined = undefined>(emails: string | readonly string[], options?: O) =>
       core.run<ContactCounts, O>(options, (call) => core.consentChange(emails, 'subscribe', call)),
     unsubscribe: <O extends CallOptions | undefined = undefined>(emails: string | readonly string[], options?: O) =>
@@ -362,7 +409,7 @@ class Core {
   async run<T, O>(options: O | undefined, work: (call: Call) => Promise<T>): Promise<Outcome<T, O>> {
     const given = options as CallOptions | undefined;
     const quiet = given?.throwOnError === false;
-    const call: Call = { options: given, tally: emptyTally() };
+    const call: Call = { options: given, tally: emptyTally(), conflicted: [] };
     try {
       if (this.#configProblem) throw invalidInput(this.#configProblem);
       const problem = callProblem(given);
@@ -375,7 +422,7 @@ class Core {
       this.#report(error);
       return { data: null, error } as Outcome<T, O>;
     } finally {
-      this.#warn(call.tally);
+      this.#warn(call);
     }
   }
 
@@ -391,19 +438,25 @@ class Core {
     return request(this.#transportNow(), { method: 'GET', path, records: 0, timeoutMs, signal });
   }
 
-  /** Sends records in batches, one after another, adding up what each batch reports. */
+  /**
+   * Sends records in batches, one after another, adding up what each batch reports.
+   * `indexOf` turns a record's place in `records` into its place in the caller's array.
+   */
   async countBatches<C extends ContactCounts | EventCounts | SignupCounts>(
     sender: Sender<C>,
     records: Json[],
     extra: Json,
-    call: Call
+    call: Call,
+    indexOf: (i: number) => number = (i) => i
   ): Promise<C> {
     let total: C | undefined;
     let sent = 0;
     for (const batch of batches(records, (r) => r)) {
       try {
-        const counts = sender.read(await this.post(sender.path, { [sender.key]: batch, ...extra }, batch.length, call));
-        sender.tally(call.tally, counts);
+        const offset = sent;
+        const body = await this.post(sender.path, { [sender.key]: batch, ...extra }, batch.length, call);
+        const counts = sender.read(body, (i) => indexOf(offset + i));
+        sender.tally(call, counts);
         total = total ? sender.add(total, counts) : counts;
         sent += batch.length;
       } catch (err) {
@@ -411,7 +464,7 @@ class Core {
         throw err;
       }
     }
-    return total ?? sender.read({});
+    return total ?? sender.read({}, indexOf);
   }
 
   /** Sends events in batches, upserting the contacts a batch carries just before it. */
@@ -426,8 +479,10 @@ class Core {
     try {
       for (const batch of batches(checked, (c) => c.record)) {
         const people = batch.flatMap((c) => (c.contact ? [c.contact] : []));
+        // The place of the event each contact came with, which is what a conflict names.
+        const owners = batch.flatMap((c, i) => (c.contact ? [sent + i] : []));
         if (people.length > 0) {
-          const landed = await this.countBatches(CONTACTS, people, extra, call);
+          const landed = await this.countBatches(CONTACTS, people, extra, call, (k) => owners[k] ?? k);
           contacts = contacts ? addContactCounts(contacts, landed) : landed;
         }
         // Judged before sending, but counted only for a batch that lands.
@@ -504,7 +559,7 @@ class Core {
 
   async #flushQueued(options: FlushOptions | undefined): Promise<FlushResult> {
     const result: FlushResult = { contacts: contactCounts({}), events: eventCounts({}), error: null };
-    const call: Call = { options, tally: emptyTally() };
+    const call: Call = { options, tally: emptyTally(), conflicted: [] };
     let events: CheckedEvent[] = [];
     let sending: 'contacts' | 'events' = 'contacts';
     try {
@@ -528,7 +583,7 @@ class Core {
       result.error = error;
       this.#report(error);
     }
-    this.#warn(call.tally);
+    this.#warn(call);
     return result;
   }
 
@@ -544,11 +599,14 @@ class Core {
     callQuietly(this.#onError, error);
   }
 
-  #warn(tally: Tally): void {
+  #warn(call: Call): void {
     if (this.#disabled || !this.#onWarning) return;
     for (const code of WARNING_CODES) {
-      const count = tally[code];
-      if (count > 0) callQuietly<AguMailWarning>(this.#onWarning, { code, message: warningMessage(code, count), count });
+      const count = call.tally[code];
+      if (count <= 0) continue;
+      const warning: AguMailWarning = { code, message: warningMessage(code, count), count };
+      if (code === 'conflicts') warning.conflicted = call.conflicted;
+      callQuietly<AguMailWarning>(this.#onWarning, warning);
     }
   }
 }
@@ -585,18 +643,34 @@ function warningMessage(code: AguMailWarningCode, n: number): string {
         `${n} ${many ? 'events' : 'event'} happened more than 72 hours ago, so AguMail stores ${them} as history ` +
         `and starts no flows from ${them}. Send events as they happen, or pass backfill: true for an import.`
       );
+    case 'unknown_user_ids':
+      return (
+        `AguMail skipped ${n} ${many ? 'contacts' : 'contact'} sent with only a userId that no contact has. ` +
+        `Send the email with the userId, so AguMail can add ${them}.`
+      );
+    case 'conflicts':
+      return (
+        `AguMail refused ${n} ${many ? 'contacts' : 'contact'} whose email belongs to someone else, so that two ` +
+        `people are never mixed up: AguMail never merges contacts. warning.conflicted lists ${them}, and why.`
+      );
   }
 }
 
 function emptyTally(): Tally {
-  return { unknown_contacts: 0, over_capacity: 0, signups_limited: 0, history: 0 };
+  return { unknown_contacts: 0, over_capacity: 0, signups_limited: 0, history: 0, unknown_user_ids: 0, conflicts: 0 };
 }
 
-/** What a disabled client answers in place of AguMail: every count zero, every address unknown. */
+/** What a disabled client answers in place of AguMail: every count zero, every address and id unknown. */
 function disabledAnswer(path: string, body: Json | undefined): Json {
   if (path !== '/api/v1/contacts/status') return {};
   const emails = (body?.emails ?? []) as string[];
-  return { contacts: emails.map((email) => ({ email, status: null, subscribed: false })) };
+  const userIds = (body?.userIds ?? []) as string[];
+  return {
+    contacts: [
+      ...emails.map((email) => ({ email, userId: null, status: null, subscribed: false })),
+      ...userIds.map((userId) => ({ email: null, userId, status: null, subscribed: false })),
+    ],
+  };
 }
 
 /** Splits items into batches the server takes: at most 500 records, and under its 5 MB body limit. */
@@ -667,14 +741,21 @@ function count(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : 0;
 }
 
-function contactCounts(body: Json): ContactCounts {
+// Counts that only newer AguMail servers send, so they are left out when the server leaves them out.
+const LATER_CONTACT_COUNTS = ['confirmationsSent', 'unknownContacts', 'conflicts'] as const;
+
+function contactCounts(body: Json, indexOf: (i: number) => number = (i) => i): ContactCounts {
   const counts: ContactCounts = {
     created: count(body.created),
     updated: count(body.updated),
     suppressedSkipped: count(body.suppressedSkipped),
     overCapacity: count(body.overCapacity),
   };
-  if (typeof body.confirmationsSent === 'number') counts.confirmationsSent = body.confirmationsSent;
+  for (const key of LATER_CONTACT_COUNTS) {
+    const value = body[key];
+    if (typeof value === 'number') counts[key] = value;
+  }
+  if (Array.isArray(body.conflicted)) counts.conflicted = (body.conflicted as Json[]).map((row) => conflict(row, indexOf));
   return counts;
 }
 
@@ -685,10 +766,21 @@ function addContactCounts(a: ContactCounts, b: ContactCounts): ContactCounts {
     suppressedSkipped: a.suppressedSkipped + b.suppressedSkipped,
     overCapacity: a.overCapacity + b.overCapacity,
   };
-  if (a.confirmationsSent !== undefined || b.confirmationsSent !== undefined) {
-    sum.confirmationsSent = (a.confirmationsSent ?? 0) + (b.confirmationsSent ?? 0);
+  for (const key of LATER_CONTACT_COUNTS) {
+    if (a[key] !== undefined || b[key] !== undefined) sum[key] = (a[key] ?? 0) + (b[key] ?? 0);
   }
+  if (a.conflicted || b.conflicted) sum.conflicted = [...(a.conflicted ?? []), ...(b.conflicted ?? [])];
   return sum;
+}
+
+/** One refused contact, numbered by its place in the caller's array rather than in its request. */
+function conflict(row: Json, indexOf: (i: number) => number): ContactConflict {
+  return {
+    index: indexOf(count(row.index)),
+    userId: typeof row.userId === 'string' ? row.userId : null,
+    email: typeof row.email === 'string' ? row.email : null,
+    reason: String(row.reason) as ContactConflictReason,
+  };
 }
 
 function eventCounts(body: Json): EventCounts {
@@ -716,8 +808,11 @@ const CONTACTS: Sender<ContactCounts> = {
   key: 'contacts',
   read: contactCounts,
   add: addContactCounts,
-  tally: (tally, counts) => {
-    tally.over_capacity += counts.overCapacity;
+  tally: (call, counts) => {
+    call.tally.over_capacity += counts.overCapacity;
+    call.tally.unknown_user_ids += counts.unknownContacts ?? 0;
+    call.tally.conflicts += counts.conflicts ?? 0;
+    if (counts.conflicted) call.conflicted.push(...counts.conflicted);
   },
 };
 
@@ -726,16 +821,17 @@ const SIGNUPS: Sender<SignupCounts> = {
   key: 'signups',
   read: signupCounts,
   add: addSignupCounts,
-  tally: (tally, counts) => {
-    tally.over_capacity += counts.overCapacity;
-    tally.signups_limited += counts.limited;
+  tally: (call, counts) => {
+    call.tally.over_capacity += counts.overCapacity;
+    call.tally.signups_limited += counts.limited;
   },
 };
 
 function statuses(body: Json): ContactStatus[] {
   const rows = Array.isArray(body.contacts) ? (body.contacts as Json[]) : [];
   return rows.map((row) => ({
-    email: String(row.email ?? ''),
+    email: typeof row.email === 'string' ? row.email : null,
+    userId: typeof row.userId === 'string' ? row.userId : null,
     status: typeof row.status === 'string' ? (row.status as ContactStatusValue) : null,
     subscribed: row.subscribed === true,
   }));

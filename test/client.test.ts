@@ -11,7 +11,7 @@ describe('methods taken off the client', () => {
     const { fetch, sent } = mockFetch((request) =>
       request.url.endsWith('/events') ? eventsOk() : request.url.endsWith('/ping') ? ok({ shop: { userId: 'u_1' } }) : contactsOk()
     );
-    const { identify, identifyMany, track, trackMany, ping, flush, queue } = client(fetch, { flushIntervalMs: 0 });
+    const { identify, identifyMany, track, trackMany, ping, flush, queue, contacts } = client(fetch, { flushIntervalMs: 0 });
     expect(await identify({ email: 'sam@example.com' })).toMatchObject({ created: 1 });
     expect(await identifyMany([{ email: 'sam@example.com' }])).toMatchObject({ created: 1 });
     expect(await track({ email: 'sam@example.com', event: 'Logged in' })).toMatchObject({ created: 1 });
@@ -19,7 +19,9 @@ describe('methods taken off the client', () => {
     expect(await ping()).toEqual({ shop: { userId: 'u_1', shopName: null } });
     queue.identify({ email: 'alex@example.com' });
     expect((await flush()).contacts.created).toBe(1);
-    expect(sent).toHaveLength(6);
+    const { statusByUserId } = contacts;
+    expect(await statusByUserId('user_1')).toMatchObject({ userId: 'user_1', status: null });
+    expect(sent).toHaveLength(7);
   });
 
   it('never throw with throwOnError: false, even with no key', async () => {
@@ -83,12 +85,21 @@ describe('disabled: true', () => {
     expect(many).toEqual({ ...zeroEvents, uniqueIds: [expect.stringMatching(UUID), 'login:2'] });
   });
 
-  it('answers every address as not on your list', async () => {
+  it('answers every address and every user id as not on your list', async () => {
     const { agumail } = disabled();
-    expect(await agumail.contacts.status('sam@example.com')).toEqual({ email: 'sam@example.com', status: null, subscribed: false });
+    expect(await agumail.contacts.status('sam@example.com')).toEqual({
+      email: 'sam@example.com',
+      userId: null,
+      status: null,
+      subscribed: false,
+    });
     expect(await agumail.contacts.status(['a@example.com', 'b@example.com'])).toEqual([
-      { email: 'a@example.com', status: null, subscribed: false },
-      { email: 'b@example.com', status: null, subscribed: false },
+      { email: 'a@example.com', userId: null, status: null, subscribed: false },
+      { email: 'b@example.com', userId: null, status: null, subscribed: false },
+    ]);
+    expect(await agumail.contacts.statusByUserId(['user_1', 2])).toEqual([
+      { email: null, userId: 'user_1', status: null, subscribed: false },
+      { email: null, userId: '2', status: null, subscribed: false },
     ]);
   });
 

@@ -10,6 +10,8 @@ export type {
   BatchOptions,
   CallOptions,
   Contact,
+  ContactConflict,
+  ContactConflictReason,
   ContactCounts,
   ContactProfile,
   ContactStatus,

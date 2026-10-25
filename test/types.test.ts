@@ -7,6 +7,8 @@ import {
   type AguMailWarning,
   type CallOptions,
   type Contact,
+  type ContactConflict,
+  type ContactConflictReason,
   type ContactCounts,
   type ContactStatus,
   type FlushResult,
@@ -78,14 +80,30 @@ describe('return types', () => {
     }
   });
 
-  it('answer one address with one status and an array with an array', () => {
+  it('answer one address or id with one status and an array with an array', () => {
     if (agumail) {
       expectTypeOf(agumail.contacts.status('a@b.co')).resolves.toEqualTypeOf<ContactStatus>();
       expectTypeOf(agumail.contacts.status(['a@b.co'])).resolves.toEqualTypeOf<ContactStatus[]>();
       expectTypeOf(agumail.contacts.status(['a@b.co'], { throwOnError: false })).resolves.toEqualTypeOf<
         Settled<ContactStatus[]>
       >();
+      expectTypeOf(agumail.contacts.statusByUserId('user_1')).resolves.toEqualTypeOf<ContactStatus>();
+      expectTypeOf(agumail.contacts.statusByUserId(42)).resolves.toEqualTypeOf<ContactStatus>();
+      expectTypeOf(agumail.contacts.statusByUserId(['user_1', 42])).resolves.toEqualTypeOf<ContactStatus[]>();
+      expectTypeOf(agumail.contacts.statusByUserId('user_1', noThrow)).resolves.toEqualTypeOf<Settled<ContactStatus>>();
     }
+  });
+
+  it('name both the email and the userId of a status, either of which can be missing', () => {
+    expectTypeOf<ContactStatus['email']>().toEqualTypeOf<string | null>();
+    expectTypeOf<ContactStatus['userId']>().toEqualTypeOf<string | null>();
+  });
+
+  it('list conflicts on the contact counts', () => {
+    expectTypeOf<ContactCounts['conflicted']>().toEqualTypeOf<ContactConflict[] | undefined>();
+    expectTypeOf<ContactConflict['reason']>().toEqualTypeOf<ContactConflictReason>();
+    expectTypeOf<ContactConflictReason>().toEqualTypeOf<'email_taken' | 'user_id_mismatch'>();
+    expectTypeOf<AguMailWarning['conflicted']>().toEqualTypeOf<ContactConflict[] | undefined>();
   });
 
   it('keep their types when detached from the client', () => {
@@ -109,6 +127,8 @@ describe('input types', () => {
       expectTypeOf(agumail.identifyMany(contacts)).resolves.toEqualTypeOf<ContactCounts>();
       expectTypeOf(agumail.trackMany(events)).resolves.toEqualTypeOf<TrackManyResult>();
       expectTypeOf(agumail.contacts.status(emails)).resolves.toEqualTypeOf<ContactStatus[]>();
+      const ids: readonly (string | number)[] = ['user_1', 2];
+      expectTypeOf(agumail.contacts.statusByUserId(ids)).resolves.toEqualTypeOf<ContactStatus[]>();
       void agumail.contacts.subscribe(emails);
       void agumail.contacts.unsubscribe(emails);
       void agumail.signups.create(signups);
@@ -121,7 +141,8 @@ describe('input types', () => {
     const maybe = undefined as string | undefined;
     if (agumail) {
       void agumail.identify({
-        email: 'a@b.co',
+        email: maybe,
+        userId: maybe,
         firstName: maybe,
         lastName: maybe,
         phone: maybe,
@@ -132,7 +153,8 @@ describe('input types', () => {
         customerSince: maybe,
       });
       void agumail.track({
-        email: 'a@b.co',
+        email: maybe,
+        userId: maybe,
         event: 'x',
         properties: undefined,
         value: undefined,
@@ -164,6 +186,20 @@ describe('input types', () => {
       flushIntervalMs: undefined,
     };
     expectTypeOf(options).toEqualTypeOf<AguMailOptions>();
+  });
+
+  it('take a userId as text or a number, beside the email or in its place', () => {
+    const user = { id: 8412, email: null as string | null };
+    if (agumail) {
+      void agumail.identify({ userId: 'user_8412' });
+      void agumail.identify({ userId: user.id, email: user.email });
+      void agumail.identifyMany([{ email: 'a@b.co' }, { userId: 2 }]);
+      void agumail.track({ userId: user.id, event: 'x', contact: { firstName: 'Sam' } });
+      void agumail.queue.identify({ userId: 'user_8412', email: undefined });
+      void agumail.queue.track({ userId: null, email: 'a@b.co', event: 'x' });
+      // @ts-expect-error the contact track upserts is named by the event's own email and userId
+      void agumail.track({ userId: 1, event: 'x', contact: { userId: 1 } });
+    }
   });
 
   it('take event properties typed by an interface, but keep contact properties flat', () => {

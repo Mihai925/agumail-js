@@ -49,10 +49,57 @@ describe('identify', () => {
     });
   });
 
-  it('passes the confirmationsSent count through when the server sends it', async () => {
-    const { fetch } = mockFetch(ok({ created: 0, updated: 1, suppressedSkipped: 0, overCapacity: 0, confirmationsSent: 1 }));
-    const result = await client(fetch).identify({ email: 'sam@example.com' });
-    expect(result.confirmationsSent).toBe(1);
+  it('passes the counts only some servers send through, when they send them', async () => {
+    const { fetch } = mockFetch(
+      ok({
+        created: 0,
+        updated: 1,
+        suppressedSkipped: 0,
+        overCapacity: 0,
+        confirmationsSent: 1,
+        unknownContacts: 0,
+        conflicts: 1,
+        conflicted: [{ index: 0, userId: 'user_77', email: 'alex@example.com', reason: 'email_taken' }],
+      })
+    );
+    const result = await client(fetch).identify({ email: 'alex@example.com', userId: 'user_77' });
+    expect(result).toEqual({
+      created: 0,
+      updated: 1,
+      suppressedSkipped: 0,
+      overCapacity: 0,
+      confirmationsSent: 1,
+      unknownContacts: 0,
+      conflicts: 1,
+      conflicted: [{ index: 0, userId: 'user_77', email: 'alex@example.com', reason: 'email_taken' }],
+    });
+  });
+
+  it('sends your userId beside the email', async () => {
+    const { fetch, sent } = mockFetch(contactsOk());
+    await client(fetch).identify({ email: 'sam@example.com', userId: 'user_8412', firstName: 'Sam' });
+    expect(sent[0]!.body.contacts[0]).toEqual({
+      email: 'sam@example.com',
+      userId: 'user_8412',
+      firstName: 'Sam',
+      consent: { optedIn: true, source: 'api' },
+    });
+  });
+
+  it('takes a userId in place of the email', async () => {
+    const { fetch, sent } = mockFetch(contactsOk());
+    await client(fetch).identify({ userId: 'user_8412', properties: { plan: 'pro' } });
+    expect(sent[0]!.body.contacts[0]).toEqual({
+      userId: 'user_8412',
+      customFields: { plan: 'pro' },
+      consent: { optedIn: true, source: 'api' },
+    });
+  });
+
+  it('sends a whole-number userId as text, and any other exactly as given', async () => {
+    const { fetch, sent } = mockFetch(contactsOk());
+    await client(fetch).identifyMany([{ userId: 8412 }, { userId: ' User_8412 ' }, { userId: 0, email: null }]);
+    expect(sent[0]!.body.contacts.map((c: any) => c.userId)).toEqual(['8412', ' User_8412 ', '0']);
   });
 
   it('leaves out fields given as null', async () => {
@@ -130,7 +177,16 @@ describe('contact properties', () => {
 describe('contact checks', () => {
   it.each([
     ['a malformed email', { email: 'sam@' }, 'contact.email is not an email address'],
-    ['a missing email', {}, 'contact.email must be an email address'],
+    ['no email and no userId', {}, 'contact.email is required when there is no userId'],
+    ['a null email and a null userId', { email: null, userId: null }, 'contact.email is required when there is no userId'],
+    ['an email that is not text', { email: 42 }, 'contact.email must be an email address'],
+    ['a malformed email beside a userId', { email: 'sam@', userId: 'user_1' }, 'contact.email is not an email address'],
+    ['an empty userId', { userId: '' }, 'contact.userId cannot be blank'],
+    ['a blank userId', { email: 'sam@example.com', userId: '  ' }, 'contact.userId cannot be blank'],
+    ['a userId over 200 characters', { userId: 'u'.repeat(201) }, 'contact.userId can be at most 200 characters'],
+    ['a userId that is not a whole number', { userId: 84.5 }, 'contact.userId must be text or a whole number'],
+    ['a userId too big to be exact', { userId: 2 ** 60 }, 'contact.userId is too big to be exact as a number'],
+    ['a userId that is an object', { userId: { id: 1 } }, 'contact.userId must be text or a whole number'],
     ['an unknown field', { email: 'sam@example.com', name: 'Sam' }, 'contact.name is not a field AguMail knows. Use firstName'],
     ['customFields instead of properties', { email: 'sam@example.com', customFields: {} }, 'Use properties'],
     ['a first name over 100 characters', { email: 'sam@example.com', firstName: 'a'.repeat(101) }, 'at most 100'],
@@ -169,6 +225,65 @@ describe('identifyMany', () => {
     expect(sent.map((r) => r.body.contacts.length)).toEqual([500, 500, 201]);
     expect(sent[2]!.body.contacts[200].email).toBe('person1200@example.com');
     expect(result).toEqual({ created: 1201, updated: 3, suppressedSkipped: 6, overCapacity: 0 });
+  });
+
+  it('adds up conflicts and unknown user ids over batches, numbering each conflict by your array', async () => {
+    const { fetch } = mockFetch((request) => {
+      const batch = request.body.contacts;
+      return ok({
+        created: batch.length - 2,
+        updated: 0,
+        suppressedSkipped: 0,
+        overCapacity: 0,
+        unknownContacts: 1,
+        conflicts: 1,
+        conflicted: [{ index: 3, userId: batch[3].userId, email: batch[3].email, reason: 'user_id_mismatch' }],
+      });
+    });
+    const users = Array.from({ length: 1201 }, (_, i) => ({ email: `person${i}@example.com`, userId: `user_${i}` }));
+    const result = await client(fetch).identifyMany(users);
+    expect(result).toEqual({
+      created: 1195,
+      updated: 0,
+      suppressedSkipped: 0,
+      overCapacity: 0,
+      unknownContacts: 3,
+      conflicts: 3,
+      conflicted: [3, 503, 1003].map((i) => ({
+        index: i,
+        userId: `user_${i}`,
+        email: `person${i}@example.com`,
+        reason: 'user_id_mismatch',
+      })),
+    });
+  });
+
+  it('numbers conflicts by your array when it puts conflicts on a partial result', async () => {
+    const { fetch } = mockFetch(
+      ok({
+        created: 499,
+        updated: 0,
+        suppressedSkipped: 0,
+        overCapacity: 0,
+        unknownContacts: 0,
+        conflicts: 1,
+        conflicted: [{ index: 7, userId: 'user_7', email: null, reason: 'email_taken' }],
+      }),
+      ok({
+        created: 99,
+        updated: 0,
+        suppressedSkipped: 0,
+        overCapacity: 0,
+        unknownContacts: 0,
+        conflicts: 1,
+        conflicted: [{ index: 2, userId: 'user_502', email: null, reason: 'email_taken' }],
+      }),
+      fail(400, 'bad')
+    );
+    const users = Array.from({ length: 1100 }, (_, i) => ({ userId: `user_${i}` }));
+    const error = await rejection(client(fetch).identifyMany(users));
+    expect(error.partial.sent).toBe(1000);
+    expect(error.partial.result.conflicted.map((c: any) => c.index)).toEqual([7, 502]);
   });
 
   it('marks every batch as history with backfill: true', async () => {

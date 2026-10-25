@@ -27,6 +27,7 @@ const UNIQUE_ID_MAX = 120;
 const EVENT_PROPERTIES_MAX = 30;
 const EVENT_PROPERTIES_CHARS = 8000;
 const STATUS_EMAIL_MAX = 320;
+const USER_ID_MAX = 200;
 const SIGNUP_EMAIL_MAX = 254;
 const FORM_ID_MAX = 100;
 const FORM_NAME_MAX = 200;
@@ -41,8 +42,8 @@ const SIGNUP_EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const BUILDER = /^[a-z0-9][a-z0-9_-]{0,39}$/;
 
 const PROFILE_FIELDS = ['firstName', 'lastName', 'phone', 'timezone', 'tags', 'properties', 'customerSince'];
-const CONTACT_FIELDS = ['email', 'subscribed', ...PROFILE_FIELDS];
-const EVENT_FIELDS = ['email', 'event', 'properties', 'value', 'occurredAt', 'uniqueId', 'contact'];
+const CONTACT_FIELDS = ['email', 'userId', 'subscribed', ...PROFILE_FIELDS];
+const EVENT_FIELDS = ['email', 'userId', 'event', 'properties', 'value', 'occurredAt', 'uniqueId', 'contact'];
 const SIGNUP_FIELDS = [
   'email',
   'doubleOptIn',
@@ -61,7 +62,12 @@ const FORM_FIELDS = ['id', 'name', 'builder'];
 const CONTACT_HINTS: Record<string, string> = {
   name: 'Use firstName and lastName.',
   customFields: 'Use properties.',
-  userId: 'AguMail identifies contacts by email for now.',
+};
+// The contact track upserts is named by the event's own email and userId.
+const PROFILE_HINTS: Record<string, string> = {
+  ...CONTACT_HINTS,
+  email: 'Put it on the event itself.',
+  userId: 'Put it on the event itself.',
 };
 const EVENT_HINTS: Record<string, string> = {
   metric: 'Use event.',
@@ -84,17 +90,17 @@ export function contactRecord(input: Contact, at: string): Json {
     throw invalidInput(`${at}.subscribed must be true or false.`);
   }
   return {
-    email: email(c.email, `${at}.email`),
+    ...identity(c, at),
     ...profileFields(c, at),
     consent: { optedIn: c.subscribed !== false, source: 'api' },
   };
 }
 
-/** The record track sends before its event: the profile only, with nothing about consent. */
-export function profileRecord(address: string, input: ContactProfile, at: string): Json {
+/** The record track sends before its event: who the event names and the profile, with nothing about consent. */
+export function profileRecord(who: Json, input: ContactProfile, at: string): Json {
   const c = object(input, at);
-  knownKeys(c, PROFILE_FIELDS, at, CONTACT_HINTS, 'Put your own fields in properties.');
-  return { email: address, ...profileFields(c, at) };
+  knownKeys(c, PROFILE_FIELDS, at, PROFILE_HINTS, 'Put your own fields in properties.');
+  return { ...who, ...profileFields(c, at) };
 }
 
 export function consentRecord(address: unknown, at: string, change: 'subscribe' | 'unsubscribe'): Json {
@@ -104,6 +110,19 @@ export function consentRecord(address: unknown, at: string, change: 'subscribe' 
   return change === 'subscribe'
     ? { email: checked, consent: { optedIn: true, source: 'my_account' } }
     : { email: checked, unsubscribed: true, consentSource: 'my_account' };
+}
+
+/**
+ * Who a contact or event is about: an email, your app's userId, or both. With a
+ * userId the server finds the person by it, and a contact record may move them
+ * to the email beside it (src/audience/contactIdentity.ts in AguMail).
+ */
+function identity(r: Json, at: string): Json {
+  const out: Json = {};
+  if (r.email !== undefined && r.email !== null) out.email = email(r.email, `${at}.email`);
+  set(out, 'userId', userId(r.userId, `${at}.userId`));
+  if (out.email === undefined && out.userId === undefined) throw invalidInput(`${at}.email is required when there is no userId.`);
+  return out;
 }
 
 function profileFields(c: Json, at: string): Json {
@@ -179,7 +198,7 @@ export interface CheckedEvent {
 export function eventRecord(input: TrackEvent, at: string): CheckedEvent {
   const e = object(input, at);
   knownKeys(e, EVENT_FIELDS, at, EVENT_HINTS);
-  const address = email(e.email, `${at}.email`);
+  const who = identity(e, at);
   const metric = requiredText(e.event, `${at}.event`, METRIC_MAX).trim();
   if (!/[A-Za-z0-9]/.test(metric)) {
     throw invalidInput(
@@ -190,7 +209,7 @@ export function eventRecord(input: TrackEvent, at: string): CheckedEvent {
   const uniqueId =
     e.uniqueId === undefined || e.uniqueId === null ? randomId() : requiredText(e.uniqueId, `${at}.uniqueId`, UNIQUE_ID_MAX);
 
-  const record: Json = { email: address, metric, uniqueId };
+  const record: Json = { ...who, metric, uniqueId };
   set(record, 'occurredAt', date(e.occurredAt, `${at}.occurredAt`));
   if (e.value !== undefined && e.value !== null) {
     if (typeof e.value !== 'number' || !Number.isFinite(e.value)) {
@@ -202,7 +221,7 @@ export function eventRecord(input: TrackEvent, at: string): CheckedEvent {
 
   const checked: CheckedEvent = { record, uniqueId };
   if (e.contact !== undefined && e.contact !== null) {
-    checked.contact = profileRecord(address, e.contact as ContactProfile, `${at}.contact`);
+    checked.contact = profileRecord(who, e.contact as ContactProfile, `${at}.contact`);
   }
   return checked;
 }
@@ -282,6 +301,13 @@ export function statusEmail(value: unknown, at: string): string {
   return value;
 }
 
+/** As loose as statusEmail: an id nobody has simply answers null. */
+export function statusUserId(value: unknown, at: string): string {
+  const id = idText(value, at);
+  if (id.length > USER_ID_MAX) throw invalidInput(`${at} can be at most ${USER_ID_MAX} characters (this one has ${id.length}).`);
+  return id;
+}
+
 // ── Shared checks ────────────────────────────────────────────────────────────
 
 export function list<T>(value: unknown, at: string): T[] {
@@ -294,6 +320,25 @@ function email(value: unknown, at: string): string {
   const trimmed = value.trim();
   if (!EMAIL.test(trimmed)) throw invalidInput(`${at} is not an email address AguMail accepts: "${value}".`);
   return trimmed;
+}
+
+/** Your app's id for a person, as the server keeps it: never trimmed or cased. */
+function userId(value: unknown, at: string): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  const id = idText(value, at);
+  if (id.trim() === '') throw invalidInput(`${at} cannot be blank.`);
+  if (id.length > USER_ID_MAX) throw invalidInput(`${at} can be at most ${USER_ID_MAX} characters (this one has ${id.length}).`);
+  return id;
+}
+
+/** An id as the server takes it, which is always text: a whole number is sent as its digits. */
+function idText(value: unknown, at: string): string {
+  if (typeof value === 'string') return value;
+  if (typeof value !== 'number' || !Number.isInteger(value)) {
+    throw invalidInput(`${at} must be text or a whole number (got ${describe(value)}).`);
+  }
+  if (!Number.isSafeInteger(value)) throw invalidInput(`${at} is too big to be exact as a number (got ${value}): send it as text.`);
+  return String(value);
 }
 
 function signupEmail(value: unknown, at: string): string {

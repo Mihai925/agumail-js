@@ -89,6 +89,36 @@ describe.skipIf(!url || !key)('live AguMail server', { timeout: 30_000 }, () => 
     expect(await agumail.contacts.status(email)).toMatchObject({ email, status: 'active', subscribed: true });
   });
 
+  it('knows a contact by your userId, and moves it to a new email', async (ctx) => {
+    const id = `agumail-js-${run}-moves`;
+    const first = address('user-id');
+    const added = await agumail.identify({ userId: id, email: first, firstName: 'Sam' });
+    if (added.conflicts === undefined) ctx.skip('this server does not know user ids yet');
+    expect(added.created).toBe(1);
+
+    const moved = address('user-id-moved');
+    expect(await agumail.identify({ userId: id, email: moved })).toMatchObject({ created: 0, updated: 1, conflicts: 0 });
+    expect(await agumail.contacts.statusByUserId(id)).toEqual({ email: moved, userId: id, status: 'active', subscribed: true });
+    expect(await agumail.contacts.status(first)).toMatchObject({ userId: null, status: null });
+    expect(await agumail.identify({ userId: id, lastName: 'Rivera' })).toMatchObject({ updated: 1, unknownContacts: 0 });
+    expect(await agumail.track({ userId: id, event: 'Logged in' })).toMatchObject({ created: 1, unknownContacts: 0 });
+  });
+
+  it('refuses an email that belongs to someone else, and skips a userId nobody has', async (ctx) => {
+    const taken = address('taken');
+    await agumail.identify({ email: taken });
+    const id = `agumail-js-${run}-other`;
+    await agumail.identify({ userId: id, email: address('other') });
+    const result = await agumail.identifyMany([{ userId: `agumail-js-${run}-nobody` }, { userId: id, email: taken }]);
+    if (result.conflicts === undefined) ctx.skip('this server does not know user ids yet');
+    expect(result).toMatchObject({
+      unknownContacts: 1,
+      conflicts: 1,
+      conflicted: [{ index: 1, userId: id, email: taken, reason: 'email_taken' }],
+    });
+    expect(await agumail.contacts.statusByUserId(`agumail-js-${run}-nobody`)).toMatchObject({ email: null, status: null });
+  });
+
   it('flushes queued contacts before their events', async () => {
     const queued = new AguMail(key, { baseUrl: url, flushIntervalMs: 0 });
     queued.queue.track({ email: address('queued'), event: 'Signed up', contact: { firstName: 'Q' } });
