@@ -10,7 +10,9 @@ import {
   type ContactConflict,
   type ContactConflictReason,
   type ContactCounts,
+  type ContactRef,
   type ContactStatus,
+  type DeleteCounts,
   type FlushResult,
   type Outcome,
   type PingResult,
@@ -92,6 +94,18 @@ describe('return types', () => {
       expectTypeOf(agumail.contacts.statusByUserId(['user_1', 42])).resolves.toEqualTypeOf<ContactStatus[]>();
       expectTypeOf(agumail.contacts.statusByUserId('user_1', noThrow)).resolves.toEqualTypeOf<Settled<ContactStatus>>();
     }
+  });
+
+  it('answer a delete with its counts', () => {
+    if (agumail) {
+      expectTypeOf(agumail.contacts.delete({ userId: 'user_1' })).resolves.toEqualTypeOf<DeleteCounts>();
+      expectTypeOf(agumail.contacts.delete({ email: 'a@b.co' }, noThrow)).resolves.toEqualTypeOf<Settled<DeleteCounts>>();
+      const refs: readonly ContactRef[] = [{ userId: 42 }, { email: 'a@b.co' }, { userId: 'u', email: 'a@b.co' }];
+      expectTypeOf(agumail.contacts.deleteMany(refs)).resolves.toEqualTypeOf<DeleteCounts>();
+      // @ts-expect-error a delete names somebody: a userId, an email, or both
+      void agumail.contacts.delete({});
+    }
+    expectTypeOf<DeleteCounts['conflicted']>().toEqualTypeOf<ContactConflict[]>();
   });
 
   it('name both the email and the userId of a status, either of which can be missing', () => {

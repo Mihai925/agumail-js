@@ -1,5 +1,6 @@
-import { describe, expect, it } from 'vitest';
-import { client, contactsOk, mockFetch, ok, rejection } from './helpers';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { AguMailWarning } from '../src/index';
+import { client, contactsOk, fail, mockFetch, ok, rejection, settle } from './helpers';
 
 describe('contacts.status', () => {
   it('asks in batches of 500 and keeps the order asked', async () => {
@@ -182,6 +183,138 @@ describe('contacts.subscribe and contacts.unsubscribe', () => {
     const { fetch, calls } = mockFetch(contactsOk());
     const error = await rejection(client(fetch).contacts.unsubscribe(['sam@example.com', 'oops']));
     expect(error.message).toContain('emails[1]');
+    expect(calls()).toBe(0);
+  });
+});
+
+describe('contacts.delete and contacts.deleteMany', () => {
+  const deletedOk = (body: Record<string, unknown> = {}) =>
+    ok({ deleted: 1, notFound: 0, conflicts: 0, conflicted: [], ...body });
+  const NONE = { deleted: 0, notFound: 0, conflicts: 0, conflicted: [] };
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('deletes by userId, sending a whole number as text', async () => {
+    const { fetch, sent } = mockFetch(deletedOk());
+    const result = await client(fetch).contacts.delete({ userId: 8412 });
+    expect(sent[0]).toMatchObject({ method: 'POST', url: 'https://api.agumail.com/api/v1/contacts/delete' });
+    expect(sent[0]!.body).toEqual({ contacts: [{ userId: '8412' }] });
+    expect(result).toEqual({ ...NONE, deleted: 1 });
+  });
+
+  it('deletes by email, or by both', async () => {
+    const { fetch, sent } = mockFetch(deletedOk());
+    await client(fetch).contacts.delete({ email: 'sam@example.com' });
+    await client(fetch).contacts.delete({ userId: 'user_1', email: 'sam@example.com' });
+    expect(sent.map((r) => r.body)).toEqual([
+      { contacts: [{ email: 'sam@example.com' }] },
+      { contacts: [{ email: 'sam@example.com', userId: 'user_1' }] },
+    ]);
+  });
+
+  it('counts someone AguMail does not have as notFound', async () => {
+    const { fetch } = mockFetch(ok({ deleted: 0, notFound: 1, conflicts: 0, conflicted: [] }));
+    expect(await client(fetch).contacts.delete({ userId: 'gone' })).toEqual({ ...NONE, notFound: 1 });
+  });
+
+  it('deletes in batches of 500, adding up the counts and numbering conflicts by their place in your array', async () => {
+    const { fetch, sent } = mockFetch(
+      (request) => ok({ deleted: request.body.contacts.length - 1, notFound: 1, conflicts: 0, conflicted: [] }),
+      ok({ deleted: 0, notFound: 0, conflicts: 1, conflicted: [{ index: 0, userId: 'user_500', email: 'x@example.com', reason: 'email_taken' }] })
+    );
+    const people = Array.from({ length: 501 }, (_, i) => ({ userId: `user_${i}`, email: `p${i}@example.com` }));
+    const result = await client(fetch).contacts.deleteMany(people);
+    expect(sent.map((r) => r.body.contacts.length)).toEqual([500, 1]);
+    expect(result).toEqual({
+      deleted: 499,
+      notFound: 1,
+      conflicts: 1,
+      conflicted: [{ index: 500, userId: 'user_500', email: 'x@example.com', reason: 'email_taken' }],
+    });
+  });
+
+  it('says how many records landed when a later batch fails', async () => {
+    const { fetch } = mockFetch(deletedOk({ deleted: 500 }), fail(400, 'contacts.0: Invalid input'));
+    const people = Array.from({ length: 501 }, (_, i) => ({ userId: `user_${i}` }));
+    const error = await rejection(client(fetch, { maxRetries: 0 }).contacts.deleteMany(people));
+    expect(error.partial).toEqual({ sent: 500, result: { ...NONE, deleted: 500 } });
+  });
+
+  it('sends nothing for no contacts', async () => {
+    const { fetch, calls } = mockFetch(ok());
+    expect(await client(fetch).contacts.deleteMany([])).toEqual(NONE);
+    expect(calls()).toBe(0);
+  });
+
+  it('takes frozen arrays', async () => {
+    const { fetch, sent } = mockFetch(deletedOk());
+    await client(fetch).contacts.deleteMany(Object.freeze([{ userId: 'user_1' }]));
+    expect(sent[0]!.body).toEqual({ contacts: [{ userId: 'user_1' }] });
+  });
+
+  it('sends an address as given, so one AguMail would not accept now can still be deleted', async () => {
+    const { fetch, sent } = mockFetch(deletedOk());
+    await client(fetch).contacts.delete({ email: 'Sam@Example.com ' });
+    expect(sent[0]!.body).toEqual({ contacts: [{ email: 'Sam@Example.com ' }] });
+  });
+
+  it.each([
+    ['neither an email nor a userId', [{}], 'contacts[0].email is required when there is no userId'],
+    ['a blank userId', [{ userId: '' }], 'contacts[0].userId cannot be blank'],
+    ['a userId over 200 characters', [{ userId: 'u'.repeat(201) }], 'contacts[0].userId can be at most 200 characters'],
+    ['an email that is not text', [{ email: 42 }], 'contacts[0].email must be an email address'],
+    ['an email over 320 characters', [{ email: `${'a'.repeat(320)}@x.co` }], 'contacts[0].email can be at most 320'],
+    ['a field AguMail does not know', [{ id: 'user_1' }], 'contacts[0].id is not a field AguMail knows'],
+    ['a record that is not an object', ['user_1'], 'contacts[0] must be an object'],
+  ])('refuses %s before sending', async (_label, input, message) => {
+    const { fetch, calls } = mockFetch(ok());
+    const error = await rejection(client(fetch).contacts.deleteMany(input as any));
+    expect(error.code).toBe('invalid_input');
+    expect(error.message).toContain(message);
+    expect(calls()).toBe(0);
+  });
+
+  it('checks every record before sending any', async () => {
+    const { fetch, calls } = mockFetch(deletedOk());
+    const error = await rejection(client(fetch).contacts.deleteMany([{ userId: 'user_1' }, { userId: null } as any]));
+    expect(error.message).toContain('contacts[1]');
+    expect(calls()).toBe(0);
+  });
+
+  it('names a bad single record as contact', async () => {
+    const { fetch } = mockFetch(ok());
+    const result = await client(fetch).contacts.delete({ userId: '' }, { throwOnError: false });
+    expect(result.error?.message).toContain('contact.userId cannot be blank');
+  });
+
+  it('retries a server error, which is safe because a contact already deleted counts as notFound', async () => {
+    vi.useFakeTimers();
+    const { fetch, calls } = mockFetch(fail(503), ok({ deleted: 0, notFound: 1, conflicts: 0, conflicted: [] }));
+    const result = await settle(client(fetch).contacts.delete({ userId: 'user_1' }));
+    expect(calls()).toBe(2);
+    expect(result).toEqual({ ...NONE, notFound: 1 });
+  });
+
+  it('resolves to { data, error } with noThrow', async () => {
+    const { fetch } = mockFetch(fail(401, 'Invalid or revoked API key.'));
+    const result = await client(fetch).contacts.delete({ userId: 'user_1' }, { throwOnError: false });
+    expect(result.data).toBeNull();
+    expect(result.error).toMatchObject({ status: 401 });
+  });
+
+  it('warns about conflicts, listing them', async () => {
+    const warnings: AguMailWarning[] = [];
+    const conflicted = [{ index: 0, userId: 'user_1', email: 'b@example.com', reason: 'email_taken' }];
+    const { fetch } = mockFetch(ok({ deleted: 0, notFound: 0, conflicts: 1, conflicted }));
+    await client(fetch, { onWarning: (w) => void warnings.push(w) }).contacts.delete({ userId: 'user_1', email: 'b@example.com' });
+    expect(warnings).toEqual([expect.objectContaining({ code: 'conflicts', count: 1, conflicted })]);
+  });
+
+  it('answers with empty counts when disabled', async () => {
+    const { fetch, calls } = mockFetch(ok());
+    expect(await client(fetch, { disabled: true }).contacts.delete({ userId: 'user_1' })).toEqual(NONE);
     expect(calls()).toBe(0);
   });
 });

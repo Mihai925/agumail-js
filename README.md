@@ -248,6 +248,27 @@ const sam = await agumail.contacts.status('sam@example.com');
 
 `status` is `null` for an address that isn't on your list, and `userId` is `null` when the contact has none. Pass an array to ask about as many addresses as you like: the package asks 500 at a time and keeps your order. To ask by your app's user ids, use [`contacts.statusByUserId`](#identify-by-your-apps-user-id).
 
+## When a user deletes their account
+
+Delete them from AguMail too:
+
+```ts
+await agumail.contacts.delete({ userId: user.id });
+```
+
+Name the person by your app's `userId`, their email, or both. With both, they must belong to the same contact: if they don't, nothing is deleted and the record is listed in `conflicted`, with the reasons from [Identify by your app's user id](#identify-by-your-apps-user-id). To delete many people, `contacts.deleteMany` takes an array and sends 500 at a time:
+
+```ts
+const result = await agumail.contacts.deleteMany(closed.map((u) => ({ userId: u.id })));
+// { deleted: 2, notFound: 1, conflicts: 0, conflicted: [] }
+```
+
+- `deleted`: contacts removed, with their properties, tags and history. A flow they were in stops for them straight away.
+- `notFound`: AguMail doesn't have them, for example because they were already deleted. This is never an error, so a delete is safe to send again, and the package retries it for you when a request fails.
+- **Unsubscribes are kept.** AguMail remembers by email address who unsubscribed, marked an email as spam or bounced, after the contact is gone. If you add the same email again later, someone who unsubscribed stays unsubscribed (they are counted in `suppressedSkipped`). Someone who never unsubscribed can be added again like anyone new.
+- Campaign and flow reports still count the emails a deleted contact was sent.
+- A deleted contact stops counting toward your plan straight away.
+
 ## Examples
 
 ### Next.js route handler
@@ -524,7 +545,7 @@ try {
     error.code;       // see below
     error.message;    // what went wrong, in words
     error.retryAfter; // on a 429, the seconds AguMail asked you to wait
-    error.partial;    // identifyMany, trackMany, flush: what landed before it failed
+    error.partial;    // identifyMany, trackMany, contacts.deleteMany, flush: what landed before it failed
     error.uniqueIds;  // track, trackMany, flush: the id each event was sent with
   }
 }
@@ -606,6 +627,8 @@ agumail.contacts.statusByUserId(userId, options?)   // Promise<ContactStatus>
 agumail.contacts.statusByUserId(userIds, options?)  // Promise<ContactStatus[]>
 agumail.contacts.subscribe(emails, options?)        // Promise<ContactCounts>
 agumail.contacts.unsubscribe(emails, options?)      // Promise<ContactCounts>
+agumail.contacts.delete(contact, options?)          // Promise<DeleteCounts>
+agumail.contacts.deleteMany(contacts, options?)     // Promise<DeleteCounts>
 agumail.forms.list(options?)                        // Promise<FormList>
 agumail.signups.create(signups, options?)           // Promise<SignupCounts>
 agumail.ping(options?)                              // Promise<PingResult>
@@ -620,6 +643,7 @@ With `throwOnError: false` (or `noThrow`), a call that resolves to `T` resolves 
 ContactCounts   // { created, updated, suppressedSkipped, overCapacity, confirmationsSent?,
                 //   unknownContacts?, conflicts?, conflicted?: ContactConflict[] }
 ContactConflict // { index, userId, email, reason: 'email_taken' | 'user_id_mismatch' }
+DeleteCounts    // { deleted, notFound, conflicts, conflicted: ContactConflict[] }
 TrackResult     // { created, duplicates, unknownContacts, uniqueId, contact?: ContactCounts }
 TrackManyResult // { created, duplicates, unknownContacts, uniqueIds, contacts?: ContactCounts }
 ContactStatus   // { email, userId, status, subscribed }
@@ -633,7 +657,6 @@ These types, and `Contact`, `TrackEvent`, `Signup` and the rest, are exported, a
 
 ## Coming
 
-- Deleting a contact.
 - Verifying AguMail's webhooks, for unsubscribes and bounces.
 - Syncing customers from Stripe and users from auth providers.
 

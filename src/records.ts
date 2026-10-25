@@ -290,6 +290,25 @@ export function signupRecord(input: Signup, at: string): Json {
   return record;
 }
 
+// ── Deletes ──────────────────────────────────────────────────────────────────
+
+const DELETE_FIELDS = ['email', 'userId'];
+
+/**
+ * Who a delete names: your app's userId, the email, or both. Only looked up, so
+ * the address is checked as loosely as statusEmail checks it: one AguMail would
+ * not accept today still finds the contact that has it.
+ */
+export function deleteRecord(input: unknown, at: string): Json {
+  const r = object(input, at);
+  knownKeys(r, DELETE_FIELDS, at, {});
+  const out: Json = {};
+  if (r.email !== undefined && r.email !== null) out.email = statusEmail(r.email, `${at}.email`);
+  set(out, 'userId', userId(r.userId, `${at}.userId`));
+  if (out.email === undefined && out.userId === undefined) throw invalidInput(`${at}.email is required when there is no userId.`);
+  return out;
+}
+
 // ── Status ───────────────────────────────────────────────────────────────────
 
 /** The status endpoint answers null for anything that is not a contact, so only the type and length are checked. */

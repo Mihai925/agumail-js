@@ -4,6 +4,7 @@ import {
   MAX_REQUEST_BYTES,
   consentRecord,
   contactRecord,
+  deleteRecord,
   eventRecord,
   isHistory,
   list,
@@ -24,8 +25,10 @@ import type {
   ContactConflict,
   ContactConflictReason,
   ContactCounts,
+  ContactRef,
   ContactStatus,
   ContactStatusValue,
+  DeleteCounts,
   EventCounts,
   FlushOptions,
   FlushResult,
@@ -140,6 +143,31 @@ export interface ContactsApi {
     emails: string | readonly string[],
     options?: O
   ): Promise<Outcome<ContactCounts, O>>;
+  /**
+   * Deletes a contact, for when the person deletes their account in your app. Name
+   * them by your app's userId, the email, or both. Someone AguMail doesn't have counts
+   * in `notFound`, never as an error, so a delete is safe to send again. Unsubscribes
+   * are kept: someone who unsubscribed and is added again stays unsubscribed.
+   *
+   * @example
+   * await agumail.contacts.delete({ userId: user.id });
+   */
+  delete<O extends CallOptions | undefined = undefined>(
+    contact: ContactRef,
+    options?: O
+  ): Promise<Outcome<DeleteCounts, O>>;
+  /**
+   * contacts.delete for any number of contacts, 500 to a request. Every record is
+   * checked first, and nothing is sent if one is wrong. Each entry of `conflicted`
+   * gives its record's place in your array as `index`.
+   *
+   * @example
+   * await agumail.contacts.deleteMany(closed.map((u) => ({ userId: u.id })));
+   */
+  deleteMany<O extends CallOptions | undefined = undefined>(
+    contacts: readonly ContactRef[],
+    options?: O
+  ): Promise<Outcome<DeleteCounts, O>>;
 }
 
 export interface FormsApi {
@@ -364,6 +392,15 @@ function contactsApi(core: Core): ContactsApi {
       core.run<ContactCounts, O>(options, (call) => core.consentChange(emails, 'subscribe', call)),
     unsubscribe: <O extends CallOptions | undefined = undefined>(emails: string | readonly string[], options?: O) =>
       core.run<ContactCounts, O>(options, (call) => core.consentChange(emails, 'unsubscribe', call)),
+    delete: <O extends CallOptions | undefined = undefined>(contact: ContactRef, options?: O) =>
+      core.run<DeleteCounts, O>(options, (call) =>
+        core.countBatches(DELETES, [deleteRecord(contact, 'contact')], {}, call)
+      ),
+    deleteMany: <O extends CallOptions | undefined = undefined>(contacts: readonly ContactRef[], options?: O) =>
+      core.run<DeleteCounts, O>(options, (call) => {
+        const records = list<unknown>(contacts, 'contacts').map((c, i) => deleteRecord(c, `contacts[${i}]`));
+        return core.countBatches(DELETES, records, {}, call);
+      }),
   };
 }
 
@@ -442,7 +479,7 @@ class Core {
    * Sends records in batches, one after another, adding up what each batch reports.
    * `indexOf` turns a record's place in `records` into its place in the caller's array.
    */
-  async countBatches<C extends ContactCounts | EventCounts | SignupCounts>(
+  async countBatches<C extends ContactCounts | EventCounts | SignupCounts | DeleteCounts>(
     sender: Sender<C>,
     records: Json[],
     extra: Json,
@@ -813,6 +850,38 @@ const CONTACTS: Sender<ContactCounts> = {
     call.tally.unknown_user_ids += counts.unknownContacts ?? 0;
     call.tally.conflicts += counts.conflicts ?? 0;
     if (counts.conflicted) call.conflicted.push(...counts.conflicted);
+  },
+};
+
+function deleteCounts(body: Json, indexOf: (i: number) => number = (i) => i): DeleteCounts {
+  const rows = Array.isArray(body.conflicted) ? (body.conflicted as Json[]) : [];
+  return {
+    deleted: count(body.deleted),
+    notFound: count(body.notFound),
+    conflicts: count(body.conflicts),
+    conflicted: rows.map((row) => conflict(row, indexOf)),
+  };
+}
+
+function addDeleteCounts(a: DeleteCounts, b: DeleteCounts): DeleteCounts {
+  return {
+    deleted: a.deleted + b.deleted,
+    notFound: a.notFound + b.notFound,
+    conflicts: a.conflicts + b.conflicts,
+    conflicted: [...a.conflicted, ...b.conflicted],
+  };
+}
+
+// The endpoint is idempotent (someone already deleted is notFound), so a batch
+// the transport retries after a lost answer counts the same people once.
+const DELETES: Sender<DeleteCounts> = {
+  path: '/api/v1/contacts/delete',
+  key: 'contacts',
+  read: deleteCounts,
+  add: addDeleteCounts,
+  tally: (call, counts) => {
+    call.tally.conflicts += counts.conflicts;
+    call.conflicted.push(...counts.conflicted);
   },
 };
 

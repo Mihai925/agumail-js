@@ -1,4 +1,4 @@
-import type { ContactCounts, EventCounts, SignupCounts } from './types';
+import type { ContactCounts, DeleteCounts, EventCounts, SignupCounts } from './types';
 
 export type AguMailErrorCode =
   | 'invalid_input'
@@ -18,7 +18,7 @@ export type AguMailErrorCode =
 export interface AguMailErrorPartial {
   /** Records AguMail accepted before the failure, counted from the start of your array. */
   sent: number;
-  result: ContactCounts | EventCounts | SignupCounts;
+  result: ContactCounts | EventCounts | SignupCounts | DeleteCounts;
 }
 
 export class AguMailError extends Error {

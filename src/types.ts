@@ -200,6 +200,7 @@ export interface ContactCounts {
 
 /**
  * - `email_taken`: the userId's contact can't move to this email, because another contact has it.
+ *   For a delete: the userId and the email belong to two different contacts.
  * - `user_id_mismatch`: the contact with this email already has a different userId.
  */
 export type ContactConflictReason = 'email_taken' | 'user_id_mismatch';
@@ -207,13 +208,35 @@ export type ContactConflictReason = 'email_taken' | 'user_id_mismatch';
 export interface ContactConflict {
   /**
    * The record's place in the array you passed, from 0: the contact's for
-   * identifyMany, the event's for trackMany. In a flush, its place among the
-   * contacts that flush sent, in the order they were queued.
+   * identifyMany and contacts.deleteMany, the event's for trackMany. In a flush,
+   * its place among the contacts that flush sent, in the order they were queued.
    */
   index: number;
   userId: string | null;
   email: string | null;
   reason: ContactConflictReason;
+}
+
+/**
+ * Who to delete: your app's userId, the email, or both. With both, they must
+ * belong to the same contact, or nothing is deleted and the record is listed in
+ * `conflicted`.
+ */
+export type ContactRef =
+  | { userId: string | number; email?: string | null | undefined }
+  | { email: string; userId?: string | number | null | undefined };
+
+export interface DeleteCounts {
+  deleted: number;
+  /**
+   * Records that name nobody AguMail has, such as someone already deleted. Never
+   * an error, so a delete is safe to send again.
+   */
+  notFound: number;
+  /** Records whose userId and email belong to two different contacts, so neither was deleted. */
+  conflicts: number;
+  /** Each record refused, and why. */
+  conflicted: ContactConflict[];
 }
 
 export interface EventCounts {
