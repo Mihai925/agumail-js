@@ -5,6 +5,13 @@
   "license": "MIT",
   "author": "AguMail",
   "homepage": "https://agumail.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Mihai925/agumail-js.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Mihai925/agumail-js/issues"
+  },
   "keywords": [
     "agumail",
     "email",
